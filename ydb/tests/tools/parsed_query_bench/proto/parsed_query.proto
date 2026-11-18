@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package Ydb.Query;
+option cc_enable_arenas = true;
+
+import "ydb/tests/tools/parsed_query_bench/proto/antlr_ast.proto";
+import "ydb/tests/tools/parsed_query_bench/proto/antlr_cst.proto";
+import "ydb/tests/tools/parsed_query_bench/proto/syntax_script.proto";
+import "ydb/tests/tools/parsed_query_bench/proto/native_query.proto";
+
+message ParsedQuery {
+  oneof stage {
+    SqlV1ParserAst antlr_ast = 1;
+    AntlrCst antlr_cst = 2;
+    SyntaxScript script = 3;
+    NativeQuery native_query = 4;
+  }
+}

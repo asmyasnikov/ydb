@@ -4,7 +4,6 @@
 LIBRARY()
 
 SRCS(
-    kqp_ast_builder.cpp
     kqp_new_parser.cpp
     kqp_name_resolver.cpp
     kqp_pragma.cpp
@@ -23,6 +22,7 @@ PEERDIR(
     yql/essentials/minikql
     ydb/core/kqp/host/new_parser/grammar/default
     ydb/core/kqp/host/new_parser/grammar/ansi
+    ydb/core/kqp/host/new_parser/syntax
     yql/essentials/parser/common/antlr4
     yql/essentials/public/issue
     yql/essentials/sql/settings
