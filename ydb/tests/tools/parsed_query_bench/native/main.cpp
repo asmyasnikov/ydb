@@ -523,7 +523,8 @@ void Export(const TString& sql, const char** paths, size_t stages, const TReques
 
 void SelfTest() {
     for (const auto* text : {"SELECT 1", "SELECT true AS present, 21u AS n WHERE true",
-        "SELECT 1; SELECT 2l", "DECLARE $unused AS Uint64; SELECT 1; SELECT 2"}) {
+        "SELECT 1; SELECT 2l", "DECLARE $unused AS Uint64; SELECT 1; SELECT 2",
+        "SELECT 1 WHERE CAST('0' AS Decimal(7,0)) = CAST('0' AS Decimal(7,0))"}) {
         const auto inputs = MakeInputs(text);
         Verify(inputs, {});
     }

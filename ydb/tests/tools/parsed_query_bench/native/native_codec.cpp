@@ -45,6 +45,7 @@ std::optional<EDataSlot> LiteralSlot(TStringBuf name) {
     if (name == "Int64") { return EDataSlot::Int64; }
     if (name == "Uint32") { return EDataSlot::Uint32; }
     if (name == "Uint64") { return EDataSlot::Uint64; }
+    if (name == "String") { return EDataSlot::String; }
     return std::nullopt;
 }
 
@@ -57,6 +58,9 @@ bool SupportedScalar(TStringBuf name) {
 }
 
 bool ValidLiteral(EDataSlot slot, TStringBuf value) {
+    if (slot == EDataSlot::String) {
+        return value.size() <= MaxSpelling;
+    }
     if (value.empty() || value.size() > 21) {
         return false;
     }

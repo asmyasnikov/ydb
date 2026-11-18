@@ -12,6 +12,7 @@ PEERDIR(
     ydb/core/kqp/expr_nodes
     ydb/core/kqp/host/new_parser
     ydb/core/kqp/host/new_parser/rbo
+    ydb/core/kqp/opt
     ydb/core/kqp/opt/rbo
     ydb/core/kqp/provider
     ydb/public/api/protos
@@ -20,6 +21,7 @@ PEERDIR(
     yql/essentials/ast
     yql/essentials/core
     yql/essentials/core/type_ann
+    yql/essentials/parser/pg_wrapper
     yql/essentials/public/udf
 )
 

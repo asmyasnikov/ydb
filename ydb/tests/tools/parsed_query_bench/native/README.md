@@ -155,6 +155,15 @@ schemas. It assigns fixture identifiers in DDL order. ClickBench uses column
 storage, matching the KQP compilation benchmark. SQL support depends on the
 operators and expressions in the selected query.
 
+To replay the 90-join [ManyJoinsWithDecimalRanges](../../../../core/kqp/ut/rbo/physical/kqp_rbo_compatibility_ut.cpp)
+workload, generate its query and the corresponding 91-table catalog and use
+the same export and benchmark commands.
+
+```sh
+query="$dir/many-joins.yql"
+python3 ydb/tests/tools/parsed_query_bench/native/corpus_catalog.py many-joins --query-out "$query" > "$dir/catalog.json"
+```
+
 ## Measurement boundary
 
 The input files are read once. Each warmup and measured round visits all
