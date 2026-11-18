@@ -8,6 +8,18 @@ carries YQL text. Field 5 carries a `ParsedQuery` whose `stage` selects
 request descriptor lives in the benchmark so that the existing Query Service
 and SDKs continue to use the published descriptor.
 
+## Five-format benchmark
+
+The [native executable](native) reads the complete serialized requests and
+compares them at the same logical plan boundary. All five routes finish with
+a KQP `TNativeQuery` and the same result contract. The benchmark verifies plan
+equivalence before the timed rounds, and measures client preparation separately.
+Build the native target directly.
+
+```sh
+./ya make --build relwithdebinfo ydb/tests/tools/parsed_query_bench/native
+```
+
 ## Syntax benchmark
 
 Build the executable and run the round-trip tests.
