@@ -87,3 +87,14 @@ def test_measurement_boundary(tmp_path):
             assert sum(phases) == int(row["total_" + clock])
             if row["stage"] == "native_query":
                 assert int(row["frontend_" + clock]) == 0
+
+
+def test_unavailable_udf(tmp_path):
+    sql = tmp_path / "query.sql"
+    sql.write_text("SELECT TestMissingModule::Probe(1);")
+    inputs = [tmp_path / (name + ".pb") for name in ("text", "ast", "cst", "script")]
+    result = subprocess.run(
+        [yatest.common.binary_path(TOOL), "--export", sql, *inputs], capture_output=True, text=True
+    )
+    assert result.returncode == 1
+    assert "testmissingmodule" in result.stderr.lower()

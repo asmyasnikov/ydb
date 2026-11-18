@@ -12,6 +12,10 @@
 
 #include <yql/essentials/ast/yql_type_string.h>
 #include <yql/essentials/core/yql_type_annotation.h>
+#include <yql/essentials/core/yql_user_data_storage.h>
+#include <yql/essentials/minikql/invoke_builtins/mkql_builtins.h>
+#include <yql/essentials/minikql/mkql_function_registry.h>
+#include <yql/essentials/providers/common/udf_resolve/yql_simple_udf_resolver.h>
 
 #include <google/protobuf/util/message_differencer.h>
 
@@ -120,6 +124,12 @@ struct TLogicalPlan {
     bool operator==(const TLogicalPlan&) const = default;
 };
 
+const NYql::IUdfResolver::TPtr& OfflineUdfResolver() {
+    static const auto registry = NMiniKQL::CreateFunctionRegistry(NMiniKQL::CreateBuiltinRegistry());
+    static const auto resolver = NYql::NCommon::CreateSimpleUdfResolver(registry.Get());
+    return resolver;
+}
+
 std::shared_ptr<TNativeQuery> LowerScript(const NNewYql::TScript& script, TExprContext& ctx, TTypeAnnotationContext& types,
     const TOfflineCatalog& catalog, const TNativeParameters& parameters, TLogicalPlan* signature = nullptr)
 {
@@ -132,6 +142,8 @@ std::shared_ptr<TNativeQuery> LowerScript(const NNewYql::TScript& script, TExprC
         [&](const TString& cluster, const TString& path) { return catalog.Resolve(cluster, path); });
     Y_ENSURE(names.IsOk(), names.Issues.ToString());
     Y_ENSURE(names.Names->ProviderPragmas.empty(), "Offline catalog cannot apply provider configuration pragmas");
+    types.UdfResolver = OfflineUdfResolver();
+    types.UserDataStorage = MakeIntrusive<NYql::TUserDataStorage>(nullptr, NYql::TUserDataTable(), nullptr, nullptr);
     const auto annotations = NNewYql::AnnotateAst(script, *names.Names, ctx, types, MakeOfflineTypeSettings(parameters, ctx));
     Y_ENSURE(annotations, ctx.IssueManager.GetIssues().ToString());
     const auto lookup = [&](const NNewYql::TTableMetadata& metadata) { return catalog.Lookup(ctx, metadata); };
@@ -664,6 +676,7 @@ TVector<EStage> ReadStages(int count, const char** names) {
 }
 
 int Run(int argc, const char** argv) {
+    OfflineUdfResolver();
     TBenchmarkContext benchmark;
     std::optional<TString> templatePath;
     int first = 1;

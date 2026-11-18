@@ -21,7 +21,10 @@ PEERDIR(
     yql/essentials/ast
     yql/essentials/core
     yql/essentials/core/type_ann
+    yql/essentials/minikql
+    yql/essentials/minikql/invoke_builtins/llvm16
     yql/essentials/parser/pg_wrapper
+    yql/essentials/providers/common/udf_resolve
     yql/essentials/public/udf
 )
 
