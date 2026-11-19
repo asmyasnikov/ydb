@@ -16,6 +16,7 @@ PEERDIR(
     ydb/core/kqp/host
     ydb/core/kqp/host/new_parser
     ydb/core/kqp/host/new_parser/rbo
+    ydb/core/kqp/node_service
     ydb/core/kqp/opt
     ydb/core/kqp/opt/rbo
     ydb/core/kqp/provider
@@ -23,10 +24,12 @@ PEERDIR(
     ydb/core/scheme
     ydb/core/testlib/basics/core
     ydb/core/tx/columnshard/data_accessor/local_db
+    ydb/core/tx/columnshard/data_sharing/manager
     ydb/core/tx/columnshard/engines/reader/common_reader/iterator
     ydb/core/tx/columnshard/engines/storage/indexes/count_min_sketch
     ydb/core/tx/columnshard/engines/storage/indexes/max
     ydb/core/tx/columnshard/engines/storage/indexes/min_max
+    ydb/core/tx/time_cast
     ydb/library/yql/providers/s3/provider
     ydb/public/api/protos
     ydb/tests/tools/parsed_query_bench/proto
@@ -42,6 +45,7 @@ PEERDIR(
     yql/essentials/providers/common/udf_resolve
     yql/essentials/public/udf
     yql/essentials/sql/pg
+    yt/yql/providers/yt/comp_nodes/dq/llvm16
     yt/yql/providers/yt/comp_nodes/llvm16
 )
 
