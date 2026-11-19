@@ -1,9 +1,13 @@
 #include "catalog.h"
+#include "host_text.h"
 #include "native_codec.h"
 
+#include <ydb/core/kqp/common/kqp_user_request_context.h>
+#include <ydb/core/kqp/host/kqp_host_impl.h>
 #include <ydb/core/kqp/host/new_parser/kqp_new_parser.h>
 #include <ydb/core/kqp/host/new_parser/rbo/kqp_rbo_lowering.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider.h>
+#include <ydb/core/kqp/provider/yql_kikimr_settings.h>
 #include <ydb/tests/tools/parsed_query_bench/measurement.h>
 #include <ydb/tests/tools/parsed_query_bench/proto/execute_query.pb.h>
 #include <ydb/tests/tools/parsed_query_bench/syntax/antlr_ast_codec.h>
@@ -16,9 +20,13 @@
 #include <yql/essentials/minikql/invoke_builtins/mkql_builtins.h>
 #include <yql/essentials/minikql/mkql_function_registry.h>
 #include <yql/essentials/providers/common/udf_resolve/yql_simple_udf_resolver.h>
+#include <yql/essentials/utils/log/log.h>
 
 #include <google/protobuf/util/message_differencer.h>
 
+#include <library/cpp/random_provider/random_provider.h>
+#include <library/cpp/time_provider/time_provider.h>
+#include <util/generic/scope.h>
 #include <util/generic/yexception.h>
 #include <util/string/cast.h>
 
@@ -30,6 +38,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <thread>
 #include <variant>
 
 namespace NKikimr::NKqp::NParsedQueryBench {
@@ -124,9 +133,13 @@ struct TLogicalPlan {
     bool operator==(const TLogicalPlan&) const = default;
 };
 
-const NYql::IUdfResolver::TPtr& OfflineUdfResolver() {
+const NMiniKQL::IFunctionRegistry& OfflineFunctionRegistry() {
     static const auto registry = NMiniKQL::CreateFunctionRegistry(NMiniKQL::CreateBuiltinRegistry());
-    static const auto resolver = NYql::NCommon::CreateSimpleUdfResolver(registry.Get());
+    return *registry;
+}
+
+const NYql::IUdfResolver::TPtr& OfflineUdfResolver() {
+    static const auto resolver = NYql::NCommon::CreateSimpleUdfResolver(&OfflineFunctionRegistry());
     return resolver;
 }
 
@@ -179,14 +192,8 @@ std::shared_ptr<TNativeQuery> LowerScript(const NNewYql::TScript& script, TExprC
         for (const auto& item : IterateSubtreeWithSubplans(root.Get(), root->PlanProps)) {
             item.Current->BindExpressionPlanProps(&root->PlanProps);
         }
-        root->RecomputeOutputIUsSubtree();
-        root->ComputeParents();
         if (signature) {
             auto& detail = signature->Roots.emplace_back();
-            detail.Plan = root->PlanToString(ctx);
-            const auto& orderedColumns = root->GetColumns().Items();
-            detail.Columns.assign(orderedColumns.begin(), orderedColumns.end());
-            detail.QueryColumns = root->GetQueryColumns();
             const auto& outputIds = names.Names->QueryOutputs.at(&query);
             const auto& resultTypes = annotations->QueryOutputs.at(&query);
             TVector<size_t> order(outputIds.size());
@@ -247,6 +254,7 @@ struct TSample {
     TMeasurementTime Start;
     TMeasurementTime Decoded;
     TMeasurementTime Imported;
+    TMeasurementTime Native;
     TMeasurementTime Done;
 };
 
@@ -309,7 +317,7 @@ void ValidateEnvelope(const TRequest& request) {
 }
 
 std::shared_ptr<TNativeQuery> ToNative(const TRequest& request, EStage stage, TExprContext& ctx,
-    std::optional<TTypeAnnotationContext>& types, const TBenchmarkContext& benchmark, std::unique_ptr<NNewYql::TScript>& script,
+    TIntrusivePtr<TTypeAnnotationContext>& types, const TBenchmarkContext& benchmark, std::unique_ptr<NNewYql::TScript>& script,
     TMeasurementTime* imported = nullptr, TLogicalPlan* signature = nullptr)
 {
     ValidateEnvelope(request);
@@ -335,7 +343,8 @@ std::shared_ptr<TNativeQuery> ToNative(const TRequest& request, EStage stage, TE
     if (plan) {
         return plan;
     }
-    return LowerScript(*script, ctx, types.emplace(), benchmark.Catalog, request.parameters(), signature);
+    types = MakeIntrusive<TTypeAnnotationContext>();
+    return LowerScript(*script, ctx, *types, benchmark.Catalog, request.parameters(), signature);
 }
 
 struct TInput {
@@ -369,9 +378,54 @@ TVector<TInput> ReadInputs(int count, const char** paths) {
     return inputs;
 }
 
+TIntrusivePtr<NYql::TKikimrSessionContext> CreateRunnerSession(const TOfflineCatalog& catalog) {
+    auto config = MakeIntrusive<NYql::TKikimrConfiguration>();
+    config->SetEnableNewRBO(true);
+    config->DisableBlockExecution = true;
+    auto session = MakeIntrusive<NYql::TKikimrSessionContext>(&OfflineFunctionRegistry(), config,
+        CreateDefaultTimeProvider(), CreateDefaultRandomProvider(), nullptr);
+    catalog.ConfigureSession(*session);
+    session->Query().PrepareOnly = true;
+    session->Query().Type = NYql::EKikimrQueryType::Query;
+    session->Query().CompileTrace = MakeIntrusive<TCompileTrace>(NWilson::TTraceId{}, nullptr);
+    return session;
+}
+
+TMeasurementTime PrepareRboRoots(const std::shared_ptr<TNativeQuery>& query, TIntrusivePtr<TTypeAnnotationContext>& types,
+    const TIntrusivePtr<NYql::TKikimrSessionContext>& session, TExprContext& ctx,
+    TVector<TIntrusivePtr<TOpRoot>>* roots = nullptr)
+{
+    const auto measurementThread = std::this_thread::get_id();
+    std::optional<TMeasurementTime> done;
+    auto& capture = session->Query().CompileTrace->CaptureRboRoots;
+    capture = [&](const auto& actualRoots, const auto&, auto&, const auto&) {
+        const auto reached = TMeasurementTime::Now();
+        Y_ENSURE(std::this_thread::get_id() == measurementThread, "RBO capture ran on a different CPU timing thread");
+        done = reached;
+        if (roots) {
+            *roots = actualRoots;
+        }
+    };
+    Y_DEFER { capture = {}; };
+    if (!types) {
+        types = MakeIntrusive<TTypeAnnotationContext>();
+    }
+    auto transform = MakeIntrusive<TKqlTransformContext>(session->ConfigPtr(), session->QueryPtr(), session->TablesPtr());
+    const auto runner = CreateKqpRunner(nullptr, session->GetCluster(), types, session, transform, OfflineFunctionRegistry(), nullptr, false);
+    const auto operation = runner->PrepareNativeQuery(query, ctx);
+    while (!operation->HasResult()) {
+        operation->Continue().GetValueSync();
+    }
+    Y_ENSURE(done, "Runner stopped before RBO root capture: " << ctx.IssueManager.GetIssues().ToString());
+    return *done;
+}
+
 void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
     const bool hasNative = inputs.size() == StageNames.size();
     Y_ENSURE(hasNative || inputs.size() == StageNames.size() - 1, "Provide four syntax requests or all five requests");
+    const auto text = std::find_if(inputs.begin(), inputs.end(), [](const TInput& input) { return input.Stage == EStage::Text; });
+    Y_ENSURE(text != inputs.end(), "Missing text reference request");
+    const auto session = CreateRunnerSession(benchmark.Catalog);
     const auto equals = google::protobuf::util::MessageDifferencer::Equals;
     std::array<bool, StageNames.size()> seen{};
     TRequest expectedEnvelope;
@@ -380,7 +434,7 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
     TLogicalPlan expectedLogicalPlan;
     TVector<TVector<TString>> expectedTypes;
     for (size_t i = 0; i < inputs.size(); ++i) {
-        const auto& [stage, bytes] = inputs[i];
+        const auto& [stage, bytes] = inputs[(text - inputs.begin() + i) % inputs.size()];
         const auto index = static_cast<size_t>(stage);
         const auto name = StageNames[index];
         Y_ENSURE(!seen[index], "Duplicate benchmark stage: " << name);
@@ -389,13 +443,25 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
         TRequest request;
         DecodeRequest(bytes, request);
         TExprContext ctx;
-        std::optional<TTypeAnnotationContext> types;
+        TIntrusivePtr<TTypeAnnotationContext> types;
         std::unique_ptr<NNewYql::TScript> script;
         TLogicalPlan logicalPlan;
         const auto plan = ToNative(request, stage, ctx, types, benchmark, script, nullptr,
             &logicalPlan);
+        TVector<TIntrusivePtr<TOpRoot>> roots;
+        PrepareRboRoots(plan, types, session, ctx, &roots);
+        Y_ENSURE(roots == plan->Roots, "Runner changed native result roots for " << name);
         CheckLambdas(*plan);
-        Y_ENSURE(logicalPlan.Roots.size() == plan->Roots.size(), "Missing logical result types for " << name);
+        Y_ENSURE(logicalPlan.Roots.size() == roots.size(), "Missing logical result types for " << name);
+        if (!hasNative) {
+            for (size_t j = 0; j < roots.size(); ++j) {
+                auto& detail = logicalPlan.Roots[j];
+                detail.Plan = roots[j]->PlanToString(ctx);
+                const auto& columns = roots[j]->GetColumns().Items();
+                detail.Columns.assign(columns.begin(), columns.end());
+                detail.QueryColumns = roots[j]->GetQueryColumns();
+            }
+        }
         TVector<TVector<TString>> actualTypes;
         for (const auto& root : logicalPlan.Roots) {
             actualTypes.push_back(root.ResultTypes);
@@ -441,7 +507,7 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
     }
 }
 
-TSample Measure(const TInput& input, const TBenchmarkContext& benchmark) {
+TSample Measure(const TInput& input, const TBenchmarkContext& benchmark, const TIntrusivePtr<NYql::TKikimrSessionContext>& session) {
     TSample sample;
     sample.Start = TMeasurementTime::Now();
     TRequest request;
@@ -449,14 +515,14 @@ TSample Measure(const TInput& input, const TBenchmarkContext& benchmark) {
     sample.Decoded = TMeasurementTime::Now();
     const auto stage = GetStage(request);
     TExprContext ctx;
-    std::optional<TTypeAnnotationContext> types;
+    TIntrusivePtr<TTypeAnnotationContext> types;
     std::unique_ptr<NNewYql::TScript> script;
     const auto plan = ToNative(request, stage, ctx, types, benchmark, script, &sample.Imported);
-    sample.Done = TMeasurementTime::Now();
+    sample.Native = TMeasurementTime::Now();
     if (stage == EStage::NativeQuery) {
-        sample.Imported = sample.Done;
+        sample.Imported = sample.Native;
     }
-    Y_ENSURE(!plan->Roots.empty(), "No native query results");
+    sample.Done = PrepareRboRoots(plan, types, session, ctx);
     return sample;
 }
 
@@ -485,16 +551,19 @@ void RunRounds(const TCases& cases, size_t warmup, size_t repeats, TMeasure&& me
 
 void Bench(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark, size_t warmup, size_t repeats) {
     Verify(inputs, benchmark);
+    const auto session = CreateRunnerSession(benchmark.Catalog);
     std::cout << "stage,iteration,bytes,decode_wall_ns,decode_cpu_ns,parse_or_import_wall_ns,parse_or_import_cpu_ns,"
-        "frontend_wall_ns,frontend_cpu_ns,total_wall_ns,total_cpu_ns\n";
+        "frontend_wall_ns,frontend_cpu_ns,native_query_wall_ns,native_query_cpu_ns,runner_wall_ns,runner_cpu_ns,total_wall_ns,total_cpu_ns\n";
     RunRounds(inputs, warmup, repeats, [&](const TInput& input) {
-        return Measure(input, benchmark);
+        return Measure(input, benchmark, session);
     }, [](const TInput& input, size_t round, const TSample& sample) {
-        const auto& [start, decoded, imported, done] = sample;
+        const auto& [start, decoded, imported, native, done] = sample;
         std::cout << StageNames[static_cast<size_t>(input.Stage)] << ',' << round << ',' << input.Bytes.size()
             << ',' << decoded.Wall - start.Wall << ',' << decoded.Cpu - start.Cpu
             << ',' << imported.Wall - decoded.Wall << ',' << imported.Cpu - decoded.Cpu
-            << ',' << done.Wall - imported.Wall << ',' << done.Cpu - imported.Cpu
+            << ',' << native.Wall - imported.Wall << ',' << native.Cpu - imported.Cpu
+            << ',' << native.Wall - start.Wall << ',' << native.Cpu - start.Cpu
+            << ',' << done.Wall - native.Wall << ',' << done.Cpu - native.Cpu
             << ',' << done.Wall - start.Wall << ',' << done.Cpu - start.Cpu << '\n';
     });
 }
@@ -676,6 +745,9 @@ TVector<EStage> ReadStages(int count, const char** names) {
 }
 
 int Run(int argc, const char** argv) {
+    NYql::NLog::TComponentHelpers::ForEach([](auto component) {
+        NYql::NLog::YqlLogger().SetComponentLevel(component, NYql::NLog::ELevel::WARN);
+    });
     OfflineUdfResolver();
     TBenchmarkContext benchmark;
     std::optional<TString> templatePath;
@@ -713,6 +785,26 @@ int Run(int argc, const char** argv) {
         std::cout << args << "-stage logical equivalence verified\n";
         return 0;
     }
+    if (mode == "--host-text" && args == 3) {
+        const auto [warmup, repeats] = Iterations(argv[first + 1], argv[first + 2]);
+        const auto bytes = ReadFile(argv[first + 3]);
+        TRequest request;
+        DecodeRequest(bytes, request);
+        Y_ENSURE(GetStage(request) == EStage::Text, "Expected a text request for the stock host");
+        TExprContext ctx;
+        TIntrusivePtr<TTypeAnnotationContext> types;
+        std::unique_ptr<NNewYql::TScript> script;
+        TLogicalPlan signature;
+        const auto plan = ToNative(request, EStage::Text, ctx, types, benchmark, script, nullptr, &signature);
+        TVector<TIntrusivePtr<TOpRoot>> roots;
+        PrepareRboRoots(plan, types, CreateRunnerSession(benchmark.Catalog), ctx, &roots);
+        TVector<TVector<TString>> expectedTypes;
+        for (auto& root : signature.Roots) {
+            expectedTypes.push_back(std::move(root.ResultTypes));
+        }
+        BenchHostText(bytes, benchmark.Catalog, roots, ctx, expectedTypes, warmup, repeats);
+        return 0;
+    }
     if (mode == "--bench" && validStageCount(args - 2)) {
         const auto [warmup, repeats] = Iterations(argv[first + 1], argv[first + 2]);
         Bench(ReadInputs(args - 2, argv + first + 3), benchmark, warmup, repeats);
@@ -730,6 +822,8 @@ int Run(int argc, const char** argv) {
            " --export QUERY.sql TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json]"
            " --verify TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
+        << "  parsed_query_native_bench [--catalog CATALOG.json]"
+           " --host-text WARMUP REPEATS TEXT.pb\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json]"
            " --bench WARMUP REPEATS TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json] [--template REQUEST.pb]"

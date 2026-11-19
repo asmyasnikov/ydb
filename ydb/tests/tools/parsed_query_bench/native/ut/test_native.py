@@ -3,6 +3,7 @@ import io
 import json
 import subprocess
 
+import pytest
 import yatest.common
 from ydb.public.api.protos import ydb_query_pb2, ydb_value_pb2
 
@@ -74,6 +75,19 @@ def test_measurement_boundary(tmp_path):
     stages = ("text", "antlr_ast", "antlr_cst", "script", "native_query")
     inputs = [tmp_path / (stage + ".pb") for stage in stages]
     subprocess.run([tool, "--catalog", catalog, "--template", template, "--export", sql, *inputs], check=True)
+    stock = subprocess.run(
+        [tool, "--catalog", catalog, "--host-text", "0", "2", inputs[0]], capture_output=True, text=True, check=True
+    )
+    stock_rows = list(csv.DictReader(io.StringIO(stock.stdout)))
+    assert [r["iteration"] for r in stock_rows] == ["0", "1"]
+    for row in stock_rows:
+        assert row["stage"] == "host_text" and int(row["bytes"]) == inputs[0].stat().st_size
+        for clock in ("wall_ns", "cpu_ns"):
+            assert int(row["total_" + clock]) >= int(row["decode_" + clock]) >= 0
+    schemas = [json.loads(line.split("=", 1)[1]) for line in stock.stderr.splitlines() if line.startswith("BENCH_RESULT_COLUMNS=")]
+    assert len(schemas) == 1 and len(schemas[0]) == 1 and len(schemas[0][0]) == 1
+    label, field_type = schemas[0][0][0]
+    assert label == "payload" and "String" in field_type
     measured = subprocess.check_output(
         [tool, "--catalog", catalog, "--bench", "0", "2", *reversed(inputs)], text=True
     )
@@ -84,9 +98,32 @@ def test_measurement_boundary(tmp_path):
         for clock in ("wall_ns", "cpu_ns"):
             phases = [int(row[phase + clock]) for phase in ("decode_", "parse_or_import_", "frontend_")]
             assert all(phase >= 0 for phase in phases)
-            assert sum(phases) == int(row["total_" + clock])
+            assert sum(phases) == int(row["native_query_" + clock])
+            assert int(row["runner_" + clock]) > 0
+            assert sum(phases) + int(row["runner_" + clock]) == int(row["total_" + clock])
             if row["stage"] == "native_query":
                 assert int(row["frontend_" + clock]) == 0
+
+
+@pytest.mark.parametrize(
+    ("other_literal", "difference"), [("3", "Logical plan differs"), ("2ul", "Logical result types differ")]
+)
+def test_rbo_results_match_text(tmp_path, other_literal, difference):
+    tool = yatest.common.binary_path(TOOL)
+    stages = ("text", "antlr_ast", "antlr_cst", "script", "native_query")
+    inputs = []
+    for i, literal in enumerate(("2", other_literal)):
+        sql = tmp_path / (str(i) + ".sql")
+        sql.write_text(f"SELECT 1; SELECT {literal};")
+        paths = [tmp_path / f"{i}-{name}.pb" for name in stages]
+        subprocess.run([tool, "--export", sql, *paths], check=True)
+        inputs.append(paths)
+    result = subprocess.run(
+        [tool, "--bench", "0", "1", inputs[1][-1], *inputs[0][:-1]], capture_output=True, text=True
+    )
+    assert result.returncode == 1
+    assert difference + " for native_query" in result.stderr
+    assert not result.stdout
 
 
 def test_unavailable_udf(tmp_path):

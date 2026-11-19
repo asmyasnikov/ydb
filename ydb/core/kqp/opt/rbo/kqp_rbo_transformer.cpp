@@ -239,7 +239,8 @@ void TKqpRewriteSelectTransformer::Rewind() {
 
 IGraphTransformer::TStatus TKqpNewRBOTransformer::DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) {
     output = input;
-    std::optional<TCompileTraceScope> traceScope(std::in_place, KqpCtx.GetCompileTrace(), TCompileTraceLevels::Step,
+    auto* trace = KqpCtx.GetCompileTrace();
+    std::optional<TCompileTraceScope> traceScope(std::in_place, trace, TCompileTraceLevels::Step,
         "Convert to new RBO operators");
     Roots.clear();
     if (TransformCtx && TransformCtx->NativeQuery) {
@@ -350,6 +351,12 @@ IGraphTransformer::TStatus TKqpNewRBOTransformer::DoTransform(TExprNode::TPtr in
             Y_ENSURE(returningResults.empty(), "RETURNING must reference an effect in the same query block");
             ++physicalTxGroup;
         }
+    }
+    if (trace && trace->CaptureRboRoots) {
+        trace->CaptureRboRoots(Roots, *input, ctx, [&] {
+            return TRBOContext(KqpCtx, ctx, TypeCtx, *RBOTypeAnnTransformer.Get(), FuncRegistry);
+        });
+        return TStatus::Error;
     }
     if (Roots.size() > 1) {
         Y_ENSURE(!KqpCtx.Config->GetEnableFallbackOnMultipleStatements(),

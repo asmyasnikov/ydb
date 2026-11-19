@@ -17,7 +17,15 @@
 #include <functional>
 #include <optional>
 
+namespace NYql {
+class TExprNode;
+struct TExprContext;
+}
+
 namespace NKikimr::NKqp {
+
+class TOpRoot;
+class TRBOContext;
 
 struct TCompileTraceLevels {
     enum : ui8 {
@@ -46,6 +54,10 @@ public:
 
     TCompileTrace(NWilson::TTraceId root, NActors::TActorSystem* actorSystem);
     ~TCompileTrace();
+
+    // A frontend benchmark can capture the converted roots and stop this compilation before optimization.
+    std::function<void(const TVector<TIntrusivePtr<TOpRoot>>&, const NYql::TExprNode&,
+        NYql::TExprContext&, const std::function<TRBOContext()>&)> CaptureRboRoots;
 
     bool IsEnabled(ui8 verbosity) const {
         return Root && verbosity <= Root.GetVerbosity();

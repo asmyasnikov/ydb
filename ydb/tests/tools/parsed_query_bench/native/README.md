@@ -1,19 +1,30 @@
 # Native frontend benchmark
 
-This executable compares request formats through construction of a logical
-`TNativeQuery`. The text path uses KQP's YQL parser. The AST, CST and script
+This executable compares request formats from serialized request bytes to the
+logical roots consumed by KQP’s new RBO. The text path uses KQP's YQL parser. The AST, CST and script
 paths import their own representations into an owning `TScript`. All four
 routes use the same KQP name resolution, type annotation and RBO lowering.
 The `native_query` path validates and imports the bound logical plan directly.
+
+```text
+Decode ExecuteQueryRequest
+  text        → YQL lexer/parser → ANTLR CST ──────────────────┐
+  antlr_ast   → restore ANTLR CST from grammar tree and tokens ├→ BuildNewYqlAst → TScript
+  antlr_cst   → restore ANTLR CST from nodes and tokens ──────┘
+  script      → restore TScript
+  TScript     → ResolveNames → AnnotateAst → LowerToRbo → wrap logical roots ─┐
+  native_query → ImportNativeQuery → check bindings against the catalog ──────┴→ TNativeQuery
+TNativeQuery → create runner → PrepareNativeQuery → DoTransform → assign Roots → ComputeParents → stop before if (Roots.size() > 1)
+```
 
 This target links the semantic frontend and RBO and has a larger build graph
 than the syntax benchmark.
 
 ```sh
-./ya make --build relwithdebinfo ydb/tests/tools/parsed_query_bench/native
+./ya make --threads=5 --build relwithdebinfo ydb/tests/tools/parsed_query_bench/native
 bench=ydb/tests/tools/parsed_query_bench/native/parsed_query_native_bench
 "$bench" --self-test
-./ya make --build relwithdebinfo -tA ydb/tests/tools/parsed_query_bench/native/ut
+./ya make --threads=5 --build relwithdebinfo -tA ydb/tests/tools/parsed_query_bench/native/ut
 ```
 
 ## Five formats without a catalog
@@ -35,6 +46,23 @@ The direct import rejects writes, physical properties and
 unsupported expressions or operators. The smoke tests check
 logical equivalence for literal selects, filters and multiple results, as well
 as argument ownership and rejection of malformed plans.
+
+## Stock text control
+
+```sh
+"$bench" --host-text 30 300 "$dir/text.pb" > "$dir/host-text.csv"
+```
+
+With a catalog, pass `--catalog catalog.json` before `--host-text`. This control
+decodes the same request and calls `IKqpHost::PrepareGenericQuery` with its SQL
+and parameter types. Each sample starts after creating a fresh host session in
+a lightweight actor runtime with cached fixture metadata and block execution
+disabled. The stock path includes host translation, parameter preparation and
+the runner through the same RBO stop. The control rejects legacy parser
+fallback. An untimed preflight compares the captured roots with the offline
+text path, computes the public result columns from the stock RBO graph and
+writes their ordered names and YQL types to stderr as `BENCH_RESULT_COLUMNS`.
+The CSV reports decode and total wall and thread CPU time.
 
 ## Catalog-backed queries
 
@@ -128,8 +156,8 @@ set -- "$dir/join-text.pb" "$dir/join-ast.pb" "$dir/join-cst.pb" "$dir/join-scri
 "$bench" --catalog catalog.json --bench 30 300 "$@" > "$dir/join-frontend.csv"
 ```
 
-The five-way check compares the logical graph and ordered result types
-before measuring. In this example `parent` is optional. To check rejection,
+Before measuring, the five-way check compares the roots captured inside RBO
+and their ordered result types against the text request. In this example `parent` is optional. To check rejection,
 replace `LEFT JOIN` with `FULL JOIN` in the sample SQL and repeat the five-file
 export. The codec reports an unsupported join kind.
 
@@ -170,7 +198,18 @@ The input files are read once. Each warmup and measured round visits all
 formats in a rotating order. The CSV records byte size and monotonic wall
 time and thread CPU time in nanoseconds. The phase columns record full
 request decode, parsing or stage import, and the remaining semantic
-frontend. `native_query` completes at the end of import. `--client`
+frontend. `native_query_*_ns` is cumulative through construction or import
+of `TNativeQuery`. The offline read-only frontend wraps lowered roots and
+rebinds their expressions in the same way as the stock host.
+The host also prepares runtime parameter declarations for execution.
+`runner_*_ns` covers runner creation, `PrepareNativeQuery`
+(including result checks, block-engine configuration and pipeline setup),
+and advancing that pipeline to `TKqpNewRBOTransformer::DoTransform`.
+`total_*_ns` ends inside this method after it assigns `Roots` and computes
+their parents, immediately before `if (Roots.size() > 1)`. The capture stops
+the pipeline before statistics or optimizer rules run. The session and its
+read-only table storage metadata are loaded outside the timer. Both benchmark
+executables disable block execution and set the YQL log level to warning. `--client`
 measures producer CPU and wall time starting from rendered YQL and ending
 at full request serialization, using the same warmup and rotation.
 

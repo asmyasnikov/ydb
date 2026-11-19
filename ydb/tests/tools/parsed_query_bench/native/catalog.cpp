@@ -2,6 +2,7 @@
 
 #include <ydb/core/kqp/expr_nodes/kqp_expr_nodes.h>
 #include <ydb/core/kqp/host/new_parser/kqp_new_parser.h>
+#include <ydb/core/kqp/provider/yql_kikimr_provider.h>
 
 #include <library/cpp/json/json_reader.h>
 #include <util/generic/hash_set.h>
@@ -113,7 +114,8 @@ TOfflineCatalog TOfflineCatalog::Load(const TString& path) {
     Y_ENSURE(PositiveInteger(catalog, "format_version") == 1, "Unsupported offline catalog format");
     TOfflineCatalog result;
     result.Cluster = NonemptyString(catalog, "cluster");
-    const auto& database = NonemptyString(catalog, "database");
+    result.Database = NonemptyString(catalog, "database");
+    const auto& database = result.Database;
     result.PathPrefix = NonemptyString(catalog, "table_path_prefix");
     Y_ENSURE(AbsolutePath(database) && AbsolutePath(result.PathPrefix)
         && (result.PathPrefix == database || UnderPath(result.PathPrefix, database)), "Invalid offline catalog path prefix");
@@ -162,6 +164,18 @@ TOfflineCatalog TOfflineCatalog::Load(const TString& path) {
         Y_ENSURE(result.Tables.emplace(metadata->Path, TEntry{metadata, storage}).second, "Duplicate offline catalog table path");
     }
     return result;
+}
+
+void TOfflineCatalog::ConfigureSession(NYql::TKikimrSessionContext& session) const {
+    session.SetCluster(Cluster);
+    session.SetDatabase(Database);
+    for (const auto& [path, entry] : Tables) {
+        auto& table = session.Tables().GetOrAddTable(Cluster, Database, path);
+        table.Metadata = MakeIntrusive<NYql::TKikimrTableMetadata>();
+        table.Metadata->DoesExist = true;
+        table.Metadata->Kind = entry.Storage == NYql::EStorageType::ColumnStorage
+            ? NYql::EKikimrTableKind::Olap : NYql::EKikimrTableKind::Datashard;
+    }
 }
 
 NNewYql::TNameResolutionSettings TOfflineCatalog::NameSettings() const {
