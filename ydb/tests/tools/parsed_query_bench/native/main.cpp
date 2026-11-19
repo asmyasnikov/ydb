@@ -1,5 +1,4 @@
 #include "../ready_client.h"
-#include "../stage_error.h"
 #include "catalog.h"
 #include "host_text.h"
 #include "native_codec.h"
@@ -55,7 +54,7 @@ constexpr std::array<TStringBuf, static_cast<size_t>(EStage::Count)> StageNames 
     "text", "antlr_ast", "antlr_cst", "script", "native_query",
 };
 
-EStage GetStage(const TRequest& request, bool allowFallback = false) {
+EStage GetStage(const TRequest& request) {
     if (request.has_query_content()) {
         Y_ENSURE(request.query_content().syntax() == Ydb::Query::SYNTAX_YQL_V1, "Expected YQL v1 query content");
         return EStage::Text;
@@ -66,9 +65,6 @@ EStage GetStage(const TRequest& request, bool allowFallback = false) {
         case Ydb::Query::ParsedQuery::kScript: return EStage::Script;
         case Ydb::Query::ParsedQuery::kNativeQuery: return EStage::NativeQuery;
         default:
-            if (allowFallback && !request.parsed_query().sql_for_fallback().empty()) {
-                return EStage::Count;
-            }
             ythrow yexception() << "Missing or unsupported ParsedQuery stage";
     }
 }
@@ -269,7 +265,6 @@ struct TSample {
 struct TBenchmarkContext {
     TOfflineCatalog Catalog;
     bool HasCatalog = false;
-    bool IncludeFallback = true;
 
     const TOfflineCatalog* NativeCatalog() const {
         return HasCatalog ? &Catalog : nullptr;
@@ -307,9 +302,6 @@ TString Prepare(EStage stage, const TString& text, const TRequest& envelope, con
         default:
             ythrow yexception() << "Missing or unsupported input format";
     }
-    if (request.has_parsed_query() && benchmark.IncludeFallback) {
-        request.mutable_parsed_query()->set_sql_for_fallback(text);
-    }
     return Encode(request);
 }
 
@@ -330,27 +322,16 @@ void ValidateEnvelope(const TRequest& request) {
 
 std::shared_ptr<TNativeQuery> ToNative(const TRequest& request, EStage stage, TExprContext& ctx,
     TIntrusivePtr<TTypeAnnotationContext>& types, const TBenchmarkContext& benchmark, std::unique_ptr<NNewYql::TScript>& script,
-    TMeasurementTime* imported = nullptr, TLogicalPlan* signature = nullptr, bool allowFallback = false)
+    TMeasurementTime* imported = nullptr, TLogicalPlan* signature = nullptr)
 {
     ValidateEnvelope(request);
     std::shared_ptr<TNativeQuery> plan;
     TNativeResultTypes outputTypes;
-    if (stage == EStage::Text) {
-        script = ToScript(request, stage);
+    if (stage == EStage::NativeQuery) {
+        plan = ImportNativeQuery(request.parsed_query().native_query(), ctx, benchmark.NativeCatalog(),
+            signature ? &outputTypes : nullptr, &request.parameters());
     } else {
-        try {
-            if (stage == EStage::NativeQuery) {
-                plan = ImportNativeQuery(request.parsed_query().native_query(), ctx, benchmark.NativeCatalog(),
-                    signature ? &outputTypes : nullptr, &request.parameters());
-            } else {
-                script = ToScript(request, stage);
-            }
-        } catch (const TStageError&) {
-            if (allowFallback && !request.parsed_query().sql_for_fallback().empty()) {
-                return {};
-            }
-            throw;
-        }
+        script = ToScript(request, stage);
     }
     if (signature) {
         for (const auto& row : outputTypes) {
@@ -463,7 +444,6 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
     const auto equals = google::protobuf::util::MessageDifferencer::Equals;
     std::array<bool, StageNames.size()> seen{};
     TRequest expectedEnvelope;
-    TString expectedSql;
     Ydb::Query::NativeQuery expectedPlan;
     std::optional<Ydb::Query::SyntaxScript> expectedScript;
     TLogicalPlan expectedLogicalPlan;
@@ -524,11 +504,6 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
         } else {
             expectedLogicalPlan = std::move(logicalPlan);
         }
-        if (i == 0) {
-            expectedSql = request.query_content().text();
-        } else if (!request.parsed_query().sql_for_fallback().empty()) {
-            Y_ENSURE(request.parsed_query().sql_for_fallback() == expectedSql, "Fallback SQL differs for " << name);
-        }
         request.clear_query();
         if (i != 0) {
             Y_ENSURE(equals(expectedEnvelope, request), "Request envelope differs for " << name);
@@ -541,64 +516,43 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
     }
 }
 
-TSample Measure(const TInput& input, const TBenchmarkContext& benchmark, const TIntrusivePtr<NYql::TKikimrSessionContext>& session,
-    bool allowFallback = false, bool printColumns = false, TLogicalPlan* checkedPlan = nullptr)
+TSample Measure(const TString& bytes, const TBenchmarkContext& benchmark,
+    const TIntrusivePtr<NYql::TKikimrSessionContext>& session, bool printColumns = false)
 {
     TSample sample;
     sample.Start = TMeasurementTime::Now();
     TRequest request;
-    DecodeRequest(input.Bytes, request);
+    DecodeRequest(bytes, request);
     sample.Decoded = TMeasurementTime::Now();
-    auto stage = GetStage(request, allowFallback);
-    const auto run = [&] {
-        TExprContext ctx;
-        TIntrusivePtr<TTypeAnnotationContext> types;
-        std::unique_ptr<NNewYql::TScript> script;
-        TLogicalPlan signature;
-        const auto plan = ToNative(request, stage, ctx, types, benchmark, script, &sample.Imported,
-            printColumns || checkedPlan ? &signature : nullptr, allowFallback);
-        if (!plan) {
-            return false;
-        }
-        sample.Native = TMeasurementTime::Now();
-        if (stage == EStage::NativeQuery) {
-            sample.Imported = sample.Native;
-        }
-        TVector<TIntrusivePtr<TOpRoot>> roots;
-        sample.Done = PrepareRboRoots(plan, types, session, ctx, checkedPlan ? &roots : nullptr);
-        if (checkedPlan) {
-            CaptureLogicalRoots(signature, roots, ctx);
-            *checkedPlan = std::move(signature);
-        }
-        if (printColumns) {
-            NJson::TJsonValue results(NJson::JSON_ARRAY);
-            for (size_t i = 0; i < plan->Roots.size(); ++i) {
-                NJson::TJsonValue columns(NJson::JSON_ARRAY);
-                const auto& resultTypes = signature.Roots.at(i).ResultTypes;
-                size_t j = 0;
-                for (const auto& item : plan->Roots[i]->GetColumns().Items()) {
-                    NJson::TJsonValue column(NJson::JSON_ARRAY);
-                    column.AppendValue(item.second);
-                    column.AppendValue(resultTypes.at(j++));
-                    columns.AppendValue(std::move(column));
-                }
-                Y_ENSURE(j == resultTypes.size(), "Result arity differs");
-                results.AppendValue(std::move(columns));
+    const auto stage = GetStage(request);
+    TExprContext ctx;
+    TIntrusivePtr<TTypeAnnotationContext> types;
+    std::unique_ptr<NNewYql::TScript> script;
+    TLogicalPlan signature;
+    const auto plan = ToNative(request, stage, ctx, types, benchmark, script, &sample.Imported,
+        printColumns ? &signature : nullptr);
+    sample.Native = TMeasurementTime::Now();
+    if (stage == EStage::NativeQuery) {
+        sample.Imported = sample.Native;
+    }
+    sample.Done = PrepareRboRoots(plan, types, session, ctx);
+    sample.Route = StageNames[static_cast<size_t>(stage)];
+    if (printColumns) {
+        NJson::TJsonValue results(NJson::JSON_ARRAY);
+        for (size_t i = 0; i < plan->Roots.size(); ++i) {
+            NJson::TJsonValue columns(NJson::JSON_ARRAY);
+            const auto& resultTypes = signature.Roots.at(i).ResultTypes;
+            size_t j = 0;
+            for (const auto& item : plan->Roots[i]->GetColumns().Items()) {
+                NJson::TJsonValue column(NJson::JSON_ARRAY);
+                column.AppendValue(item.second);
+                column.AppendValue(resultTypes.at(j++));
+                columns.AppendValue(std::move(column));
             }
-            std::cerr << "BENCH_RESULT_COLUMNS=" << NJson::WriteJson(results, false) << '\n';
+            Y_ENSURE(j == resultTypes.size(), "Result arity differs");
+            results.AppendValue(std::move(columns));
         }
-        return true;
-    };
-    if (stage != EStage::Count && run()) {
-        sample.Route = StageNames[static_cast<size_t>(stage)];
-    } else {
-        const TString sql = request.parsed_query().sql_for_fallback();
-        auto* content = request.mutable_query_content();
-        content->set_syntax(Ydb::Query::SYNTAX_YQL_V1);
-        content->set_text(sql);
-        stage = EStage::Text;
-        run();
-        sample.Route = "sql_fallback";
+        std::cerr << "BENCH_RESULT_COLUMNS=" << NJson::WriteJson(results, false) << '\n';
     }
     return sample;
 }
@@ -626,18 +580,15 @@ void RunRounds(const TCases& cases, size_t warmup, size_t repeats, TMeasure&& me
     }
 }
 
-void Bench(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark, size_t warmup, size_t repeats, bool fallback = false) {
-    if (!fallback) {
-        Verify(inputs, benchmark);
-    }
+void Bench(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark, size_t warmup, size_t repeats) {
+    Verify(inputs, benchmark);
     const auto session = CreateRunnerSession(benchmark.Catalog);
     std::cout << "stage,iteration,bytes,decode_wall_ns,decode_cpu_ns,parse_or_import_wall_ns,parse_or_import_cpu_ns,"
         "frontend_wall_ns,frontend_cpu_ns,native_query_wall_ns,native_query_cpu_ns,runner_wall_ns,runner_cpu_ns,total_wall_ns,total_cpu_ns\n";
     RunRounds(inputs, warmup, repeats, [&](const TInput& input) {
-        return Measure(input, benchmark, session, fallback);
+        return Measure(input.Bytes, benchmark, session);
     }, [&](const TInput& input, size_t round, const TSample& sample) {
         const auto& [start, decoded, imported, native, done, route] = sample;
-        Y_ENSURE(!fallback || input.Stage == EStage::Text || route == "sql_fallback", "Expected SQL fallback");
         std::cout << route << ',' << round << ',' << input.Bytes.size()
             << ',' << decoded.Wall - start.Wall << ',' << decoded.Cpu - start.Cpu
             << ',' << imported.Wall - decoded.Wall << ',' << imported.Cpu - decoded.Cpu
@@ -690,37 +641,41 @@ void SelfTest() {
         TRequest request;
         DecodeRequest(Prepare(EStage::Script, sql, ExecutionEnvelope(), benchmark), request);
         auto* parsed = request.mutable_parsed_query();
-        Y_ENSURE(parsed->sql_for_fallback() == sql, "Writer lost fallback SQL");
-        parsed->set_sql_for_fallback("INVALID SQL");
-        const auto resolve = [&] { return Measure({EStage::Count, Encode(request)}, benchmark, session, true).Route; };
+        Y_ENSURE(parsed->GetReflection()->GetUnknownFields(*parsed).empty(), "Unexpected ParsedQuery fields");
+        auto* fields = parsed->GetReflection()->MutableUnknownFields(parsed);
+        fields->AddLengthDelimited(1, sql);
+        const auto resolve = [&] { return Measure(Encode(request), benchmark, session).Route; };
+        const auto checkRejected = [&](TStringBuf diagnostic) {
+            try {
+                resolve();
+            } catch (const yexception& error) {
+                Y_ENSURE(TStringBuf(error.what()).Contains(diagnostic), error.what());
+                return;
+            }
+            ythrow yexception() << "Invalid request was accepted";
+        };
         Y_ENSURE(resolve() == "script", "Valid script must take its structured route");
-        parsed->set_sql_for_fallback(sql);
         parsed->mutable_script()->set_format_version(0);
-        Y_ENSURE(resolve() == "sql_fallback", "Incompatible script must fall back");
+        checkRejected("Unsupported SyntaxScript format version");
         parsed->mutable_main_antlr_ast();
-        Y_ENSURE(resolve() == "sql_fallback", "Unsupported stage must fall back");
+        checkRejected("Missing or unsupported ParsedQuery stage");
+        parsed->mutable_yql_ast();
+        checkRejected("Missing or unsupported ParsedQuery stage");
+        parsed->mutable_kql_query_list();
+        checkRejected("Missing or unsupported ParsedQuery stage");
         parsed->clear_stage();
-        Y_ENSURE(resolve() == "sql_fallback", "Absent stage must fall back");
-        parsed->clear_sql_for_fallback();
-        bool rejected = false;
-        try {
-            resolve();
-        } catch (const yexception&) {
-            rejected = true;
-        }
-        Y_ENSURE(rejected, "Absent stage with no fallback must fail");
+        checkRejected("Missing or unsupported ParsedQuery stage");
+        fields->AddLengthDelimited(9, "");
+        checkRejected("Missing or unsupported ParsedQuery stage");
+
         DecodeRequest(Prepare(EStage::NativeQuery, sql, ExecutionEnvelope(), benchmark), request);
-        auto* native = request.mutable_parsed_query()->mutable_native_query();
+        parsed = request.mutable_parsed_query();
+        parsed->GetReflection()->MutableUnknownFields(parsed)->AddLengthDelimited(1, sql);
+        auto* native = parsed->mutable_native_query();
         for (size_t i = 0; i < 65; ++i) {
             native->add_functions();
         }
-        rejected = false;
-        try {
-            resolve();
-        } catch (const yexception& error) {
-            rejected = TStringBuf(error.what()).Contains("function or type registry size");
-        }
-        Y_ENSURE(rejected, "Registry size limit must fail even with valid fallback SQL");
+        checkRejected("function or type registry size");
     }
     for (const auto* text : {"SELECT 1", "SELECT true AS present, 21u AS n WHERE true",
         "SELECT 1; SELECT 2l", "DECLARE $unused AS Uint64; SELECT 1; SELECT 2",
@@ -873,11 +828,6 @@ int Run(int argc, const char** argv) {
     int first = 1;
     while (first + 1 < argc) {
         const TStringBuf option = argv[first];
-        if (option == "--without-sql-fallback") {
-            benchmark.IncludeFallback = false;
-            ++first;
-            continue;
-        }
         if (option == "--catalog") {
             Y_ENSURE(!benchmark.HasCatalog, "Specify one offline catalog");
             benchmark.Catalog = TOfflineCatalog::Load(argv[first + 1]);
@@ -896,35 +846,13 @@ int Run(int argc, const char** argv) {
     };
     const int args = argc - first - 1;
     Y_ENSURE(!templatePath || mode == "--export" || mode == "--client", "Request template is only used for export and client timing");
-    Y_ENSURE(benchmark.IncludeFallback || mode == "--export" || mode == "--client",
-        "--without-sql-fallback only applies to export and client timing");
     if (mode == "--client-ready" && args >= 3) {
         const auto [warmup, repeats] = Iterations(argv[first + 1], argv[first + 2]);
         return RunReadyClient(warmup, repeats, ReadInputs(args - 2, argv + first + 3), StageNames);
     }
     if (mode == "--check-request" && args == 1) {
-        const auto sample = Measure({EStage::Count, ReadFile(argv[first + 1])}, benchmark, CreateRunnerSession(benchmark.Catalog), true, true);
+        const auto sample = Measure(ReadFile(argv[first + 1]), benchmark, CreateRunnerSession(benchmark.Catalog), true);
         std::cout << "BENCH_ROUTE=" << sample.Route << '\n';
-        return 0;
-    }
-    if (mode == "--bench-fallback" && args == 4) {
-        const auto [warmup, repeats] = Iterations(argv[first + 1], argv[first + 2]);
-        TVector<TInput> inputs = {{EStage::Text, ReadFile(argv[first + 3])}, {EStage::Count, ReadFile(argv[first + 4])}};
-        TRequest reference, parsed;
-        DecodeRequest(inputs[0].Bytes, reference);
-        DecodeRequest(inputs[1].Bytes, parsed);
-        Y_ENSURE(GetStage(reference) == EStage::Text && parsed.has_parsed_query()
-            && !parsed.parsed_query().sql_for_fallback().empty()
-            && reference.query_content().text() == parsed.parsed_query().sql_for_fallback(), "Fallback SQL differs from reference");
-        reference.clear_query();
-        parsed.clear_query();
-        Y_ENSURE(google::protobuf::util::MessageDifferencer::Equals(reference, parsed), "Fallback request envelope differs");
-        const auto session = CreateRunnerSession(benchmark.Catalog);
-        TLogicalPlan expected, actual;
-        Measure(inputs[0], benchmark, session, false, false, &expected);
-        Y_ENSURE(Measure(inputs[1], benchmark, session, true, false, &actual).Route == "sql_fallback", "Expected SQL fallback");
-        Y_ENSURE(expected == actual, "Fallback logical roots or result columns differ from reference");
-        Bench(inputs, benchmark, warmup, repeats, true);
         return 0;
     }
     if (mode == "--self-test" && args == 0 && !benchmark.HasCatalog) {
@@ -973,7 +901,7 @@ int Run(int argc, const char** argv) {
     }
     std::cerr << "Usage:\n"
         << "  parsed_query_native_bench --self-test\n"
-        << "  parsed_query_native_bench [--catalog CATALOG.json] [--template REQUEST.pb] [--without-sql-fallback]"
+        << "  parsed_query_native_bench [--catalog CATALOG.json] [--template REQUEST.pb]"
            " --export QUERY.sql TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json]"
            " --verify TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
@@ -981,10 +909,9 @@ int Run(int argc, const char** argv) {
            " --host-text WARMUP REPEATS TEXT.pb\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json]"
            " --bench WARMUP REPEATS TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
-        << "  parsed_query_native_bench [--catalog CATALOG.json] [--template REQUEST.pb] [--without-sql-fallback]"
+        << "  parsed_query_native_bench [--catalog CATALOG.json] [--template REQUEST.pb]"
            " --client WARMUP REPEATS QUERY.sql STAGE...\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json] --check-request REQUEST.pb\n"
-        << "  parsed_query_native_bench [--catalog CATALOG.json] --bench-fallback WARMUP REPEATS TEXT.pb PARSED.pb\n"
         << "  parsed_query_native_bench --client-ready WARMUP REPEATS REQUEST.pb...\n"
         << "  Include NATIVE.pb for inputs supported by the native codec.\n";
     return 2;

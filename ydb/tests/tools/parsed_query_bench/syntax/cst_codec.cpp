@@ -13,8 +13,6 @@
 #include <yql/essentials/parser/common/issue.h>
 
 #include <util/charset/utf8.h>
-#include <ydb/tests/tools/parsed_query_bench/stage_error.h>
-
 #include <util/generic/yexception.h>
 
 #include <string_view>
@@ -46,7 +44,7 @@ void Check(bool condition, const char* message) {
 }
 
 void CheckFields(const google::protobuf::Message& message) {
-    RequireStage(message.GetReflection()->GetUnknownFields(message).empty(), "unknown protobuf fields");
+    Check(message.GetReflection()->GetUnknownFields(message).empty(), "unknown protobuf fields");
 }
 
 bool IsHint(std::string_view comment) {
@@ -228,7 +226,7 @@ public:
         Index.reserve(input.nodes_size());
         for (int i = 0; i != input.nodes_size(); ++i) {
             const auto& node = input.nodes(i);
-            RequireStage(node.id() != 0 && Index.emplace(node.id(), i).second, "missing or duplicate node ID");
+            Check(node.id() != 0 && Index.emplace(node.id(), i).second, "missing or duplicate node ID");
         }
     }
 
@@ -261,7 +259,7 @@ private:
             auto terminal = std::make_unique<antlr4::tree::TerminalNodeImpl>(&Tokens[node.token_index()]);
             return Restored.emplace_back(std::move(terminal)).get();
         }
-        RequireStage(node.has_rule(), "missing node kind");
+        Check(node.has_rule(), "missing node kind");
         const auto& rule = node.rule();
         CheckFields(rule);
         Check(NextVisible < Visible.size() && rule.start_token_index() == Visible[NextVisible], "invalid rule start");
@@ -437,11 +435,11 @@ AntlrCst ExportAntlrCst(const TString& sql, NSQLTranslation::TTranslationSetting
 TImportedParserTokens ImportParserTokens(const YqlParserMetadata& metadata, const TParserTokenFields& tokens) {
     CheckFields(metadata);
     CheckFields(metadata.directives());
-    RequireStage(metadata.grammar_fingerprint() == std::string_view(GrammarFingerprint, 32), "unknown grammar fingerprint");
-    RequireStage(metadata.lexer_mode() == YqlParserMetadata::DEFAULT || metadata.lexer_mode() == YqlParserMetadata::ANSI,
+    Check(metadata.grammar_fingerprint() == std::string_view(GrammarFingerprint, 32), "unknown grammar fingerprint");
+    Check(metadata.lexer_mode() == YqlParserMetadata::DEFAULT || metadata.lexer_mode() == YqlParserMetadata::ANSI,
         "unsupported lexer mode");
     const bool ansi = metadata.lexer_mode() == YqlParserMetadata::ANSI;
-    RequireStage((ansi || !metadata.directives().explicit_ansi_lexer()) && metadata.hints().empty(),
+    Check((ansi || !metadata.directives().explicit_ansi_lexer()) && metadata.hints().empty(),
         "inconsistent lexer directive or unsupported query hints");
     Check(metadata.source_name().size() <= 4096, "source name limit exceeded");
     TSourcePosition().Advance(metadata.source_name());
@@ -472,7 +470,7 @@ std::unique_ptr<NNewYql::TScript> ParseText(const TString& sql, NSQLTranslation:
 
 std::unique_ptr<NNewYql::TScript> ImportAntlrCst(const AntlrCst& cst) {
     CheckFields(cst);
-    RequireStage(cst.format_version() == FormatVersion && cst.has_metadata(), "unsupported envelope version");
+    Check(cst.format_version() == FormatVersion && cst.has_metadata(), "unsupported envelope version");
     Check(cst.nodes_size() > 0 && static_cast<size_t>(cst.nodes_size()) <= MaxNodes, "node limit exceeded");
 
     auto input = ImportParserTokens(cst.metadata(), cst.tokens());

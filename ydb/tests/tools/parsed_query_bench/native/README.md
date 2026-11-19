@@ -27,27 +27,20 @@ bench=ydb/tests/tools/parsed_query_bench/native/parsed_query_native_bench
 ./ya make --threads=5 --build relwithdebinfo -tA ydb/tests/tools/parsed_query_bench/native/ut
 ```
 
-## Fallback and prepared requests
+## Prepared requests
 
-Structured exports include the original YQL in `parsed_query.sql_for_fallback`.
-Pass `--without-sql-fallback` before `--export` or `--client` to omit it.
 Regenerate inputs written with the older prototype, which used different stage numbers.
 
 ```sh
 "$bench" --check-request REQUEST.pb
-"$bench" --bench-fallback 30 300 TEXT.pb PARSED.pb
 "$bench" --client-ready 30 300 REQUEST.pb...
 ```
 
 `--check-request` reports the selected route and ordered result columns after
-reaching the RBO roots. A missing or unsupported stage, incompatible format or grammar, and explicitly
-recognized wire-shape errors can use nonempty fallback SQL. Catalog binding,
-parameter binding and resource-limit errors propagate. Envelope validation, text parsing, name and type
-resolution after syntax import, and runner errors propagate. The fallback timing
-requires matching reference SQL and request settings and labels its samples
-`sql_fallback`. Regular verification and benchmark rounds require each input to
-reach the roots through its declared stage. Use `--client-ready` for client
-serialization when the structured representation is already available.
+reaching the RBO roots. Missing, unsupported or malformed stages fail. Verification
+and benchmark rounds require each input to reach the roots through its declared
+stage. Use `--client-ready` for client serialization when the structured
+representation is already available.
 
 ## Five formats without a catalog
 
@@ -80,8 +73,7 @@ decodes the same request and calls `IKqpHost::PrepareGenericQuery` with its SQL
 and parameter types. Each sample starts after creating a fresh host session in
 a lightweight actor runtime with cached fixture metadata and block execution
 disabled. The stock path includes host translation, parameter preparation and
-the runner through the same RBO stop. The control rejects legacy parser
-fallback. An untimed preflight compares the captured roots with the offline
+the runner through the same RBO stop. The control requires the NewParser path. An untimed preflight compares the captured roots with the offline
 text path, computes the public result columns from the stock RBO graph and
 writes their ordered names and YQL types to stderr as `BENCH_RESULT_COLUMNS`.
 The CSV reports decode and total wall and thread CPU time.

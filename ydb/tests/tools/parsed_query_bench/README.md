@@ -3,8 +3,8 @@
 Compare the text and structured inputs to the YQL frontend from
 [ydb-platform/ydb#58587](https://github.com/ydb-platform/ydb/pull/58587).
 The wire prototype preserves the fields of `ExecuteQueryRequest`. Field 4
-carries YQL text. Field 5 carries a `ParsedQuery` with an optional copy of the original SQL in
-`sql_for_fallback` (field 1). NewParser supports `antlr_ast` (2), `antlr_cst` (3),
+carries YQL text. Field 5 carries a `ParsedQuery`. NewParser supports
+`antlr_ast` (2), `antlr_cst` (3),
 `script` (4) and `native_query` (5). The common schema also defines the main
 stages `yql_ast` (6), `kql_query_list` (7) and `main_antlr_ast` (8). The experimental
 request descriptor lives in the benchmark so that the existing Query Service
@@ -33,9 +33,7 @@ Build the executable and run the round-trip tests.
 
 Prepare a binary request for each syntax input. The optional final argument
 to `prepare` is an existing binary request containing the session, transaction
-control, parameters and other request settings. The tool replaces its query. Both writers include the original SQL in
-structured requests by default. Prefix `prepare` or `client` with
-`--without-sql-fallback` to omit it.
+control, parameters and other request settings. The tool replaces its query.
 
 ```sh
 bench=ydb/tests/tools/parsed_query_bench/parsed_query_bench

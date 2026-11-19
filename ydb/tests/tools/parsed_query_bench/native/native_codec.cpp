@@ -10,8 +10,6 @@
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
 #include <util/generic/scope.h>
-#include <ydb/tests/tools/parsed_query_bench/stage_error.h>
-
 #include <util/generic/yexception.h>
 #include <util/string/cast.h>
 #include <util/string/builder.h>
@@ -33,7 +31,7 @@ constexpr size_t MaxSpelling = 1024;
 
 template <class TMessage>
 void CheckFields(const TMessage& message) {
-    RequireStage(message.GetReflection()->GetUnknownFields(message).empty(), "Unknown NativeQuery field");
+    Y_ENSURE(message.GetReflection()->GetUnknownFields(message).empty(), "Unknown NativeQuery field");
 }
 
 TString CopyString(TStringBuf value) {
@@ -1171,12 +1169,12 @@ std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ct
     TNativeResultTypes* resultTypes, const TNativeParameters* parameters)
 {
     CheckFields(query);
-    RequireStage(query.format_version() == 1 && TStringBuf(query.semantics_version()) == SemanticsVersion,
+    Y_ENSURE(query.format_version() == 1 && TStringBuf(query.semantics_version()) == SemanticsVersion,
         "Unsupported NativeQuery format or semantics version");
-    RequireStage(query.required_features().empty() && !query.has_context() && !query.has_diagnostics()
-        && !query.roots().empty() && query.roots_size() == query.results_size(), "Unsupported NativeQuery context or execution shape");
-    Y_ENSURE(static_cast<size_t>(query.parameters_size()) <= MaxInformationUnits
-        && static_cast<size_t>(query.roots_size()) <= MaxNodes, "NativeQuery parameter or root count exceeds limit");
+    Y_ENSURE(query.required_features().empty() && !query.has_context() && !query.has_diagnostics()
+        && !query.roots().empty() && static_cast<size_t>(query.parameters_size()) <= MaxInformationUnits
+        && static_cast<size_t>(query.roots_size()) <= MaxNodes && query.roots_size() == query.results_size(),
+        "Unsupported NativeQuery context or execution shape");
     CheckFields(query.execution());
     Y_ENSURE(!query.execution().has_uncommitted_changes_read(), "Unsupported NativeQuery uncommitted reads");
     TVector<const TTypeAnnotationNode*> types;
@@ -1186,7 +1184,7 @@ std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ct
         "Unsupported NativeQuery function or type registry size");
     for (const auto& type : query.types()) {
         CheckFields(type);
-        RequireStage(type.id() == types.size() + 1, "Invalid NativeQuery type ID");
+        Y_ENSURE(type.id() == types.size() + 1, "Invalid NativeQuery type ID");
         size_t depth = 1;
         const auto item = [&](ui32 id) {
             Y_ENSURE(id > 0 && id <= types.size(), "Invalid or forward NativeQuery type reference");

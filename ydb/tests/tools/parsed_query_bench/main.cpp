@@ -61,7 +61,7 @@ TStringBuf Stage(const TRequest& request) {
     }
 }
 
-TString Prepare(TStringBuf stage, const TString& sql, const TRequest& envelope, bool includeFallback) {
+TString Prepare(TStringBuf stage, const TString& sql, const TRequest& envelope) {
     TRequest request(envelope);
     request.clear_query();
     if (stage == "text") {
@@ -76,9 +76,6 @@ TString Prepare(TStringBuf stage, const TString& sql, const TRequest& envelope, 
         *request.mutable_parsed_query()->mutable_script() = ExportSyntaxScript(sql, {});
     } else {
         ythrow yexception() << "Unsupported syntax stage: " << stage;
-    }
-    if (request.has_parsed_query() && includeFallback) {
-        request.mutable_parsed_query()->set_sql_for_fallback(sql);
     }
     TString bytes;
     Y_ENSURE(request.SerializeToString(&bytes) && bytes.size() <= MaxRequestBytes, "Cannot encode request within 16 MiB");
@@ -110,13 +107,7 @@ struct TInput {
 };
 
 int Run(int argc, char** argv) {
-    const bool includeFallback = argc < 2 || TStringBuf(argv[1]) != "--without-sql-fallback";
-    if (!includeFallback) {
-        ++argv;
-        --argc;
-    }
     const TStringBuf mode = argc > 1 ? argv[1] : "";
-    Y_ENSURE(includeFallback || mode == "prepare" || mode == "client", "--without-sql-fallback only applies to writers");
     if (mode == "prepare" && (argc == 5 || argc == 6)) {
         TRequest envelope;
         if (argc == 6) {
@@ -124,7 +115,7 @@ int Run(int argc, char** argv) {
         } else {
             envelope.set_exec_mode(Ydb::Query::EXEC_MODE_EXECUTE);
         }
-        const auto bytes = Prepare(argv[2], ReadInput(argv[3]), envelope, includeFallback);
+        const auto bytes = Prepare(argv[2], ReadInput(argv[3]), envelope);
         TFileOutput(argv[4]).Write(bytes);
         return 0;
     }
@@ -200,7 +191,7 @@ int Run(int argc, char** argv) {
             sample.Bytes = item.Bytes.size();
             if (mode == "client") {
                 sample.Start = sample.Decoded = TMeasurementTime::Now();
-                const auto bytes = Prepare(item.Label, sql, envelope, includeFallback);
+                const auto bytes = Prepare(item.Label, sql, envelope);
                 sample.Done = TMeasurementTime::Now();
                 sample.Bytes = bytes.size();
             } else if (mode == "decode" && item.Label == "old") {

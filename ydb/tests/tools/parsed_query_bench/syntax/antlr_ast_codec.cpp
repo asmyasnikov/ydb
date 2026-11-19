@@ -11,8 +11,6 @@
 #include <yql/essentials/parser/proto_ast/gen/v1_ansi_antlr4/SQLv1Antlr4Lexer.h>
 #include <yql/essentials/parser/proto_ast/gen/v1_ansi_antlr4/SQLv1Antlr4Parser.h>
 
-#include <ydb/tests/tools/parsed_query_bench/stage_error.h>
-
 #include <util/generic/yexception.h>
 
 #include <limits>
@@ -43,7 +41,7 @@ void Check(bool condition, const char* message) {
 }
 
 void CheckFields(const Message& node) {
-    RequireStage(node.GetReflection()->GetUnknownFields(node).empty(), "unknown protobuf fields");
+    Check(node.GetReflection()->GetUnknownFields(node).empty(), "unknown protobuf fields");
 }
 
 template <class TLexer, class TParser>
@@ -155,7 +153,7 @@ private:
             "invalid rule or block start");
         const size_t begin = Next;
         if (const auto* alt = descriptor->FindOneofByName("Alt")) {
-            RequireStage(reflection->GetOneofFieldDescriptor(node, alt) != nullptr, "missing grammar alternative");
+            Check(reflection->GetOneofFieldDescriptor(node, alt) != nullptr, "missing grammar alternative");
         }
         // Generated field numbers follow the production order. TBlock and TAlt
         // preserve choices and repetitions in protobuf but are invisible in ANTLR CST.
@@ -225,7 +223,7 @@ SqlV1ParserAst ExportAntlrAst(const TString& sql, NSQLTranslation::TTranslationS
 
 std::unique_ptr<NNewYql::TScript> ImportAntlrAst(const SqlV1ParserAst& input) {
     CheckFields(input);
-    RequireStage(input.format_version() == FormatVersion && input.has_metadata() && input.has_ast(), "invalid envelope");
+    Check(input.format_version() == FormatVersion && input.has_metadata() && input.has_ast(), "invalid envelope");
     auto imported = ImportParserTokens(input.metadata(), input.tokens());
     TProtoCst tree(imported.Tokens);
     auto& root = tree.Restore(input.ast());
