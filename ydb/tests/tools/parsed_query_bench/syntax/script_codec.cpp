@@ -2,6 +2,8 @@
 
 #include <ydb/tests/tools/parsed_query_bench/measurement.h>
 
+#include <ydb/tests/tools/parsed_query_bench/stage_error.h>
+
 #include <util/generic/yexception.h>
 
 #include <limits>
@@ -1459,13 +1461,13 @@ void ValidateSyntaxScriptLimits(const PS& script) {
 std::unique_ptr<TScript> ImportScript(const PS& script) {
     TReadBudget budget;
     auto scope = budget.Enter(script);
-    Y_ENSURE(script.format_version() == 1, "Unsupported SyntaxScript format version");
-    Y_ENSURE(script.lexer_mode() == Metadata::ANSI || script.lexer_mode() == Metadata::DEFAULT,
+    RequireStage(script.format_version() == 1, "Unsupported SyntaxScript format version");
+    RequireStage(script.lexer_mode() == Metadata::ANSI || script.lexer_mode() == Metadata::DEFAULT,
         "Unsupported SyntaxScript lexer mode");
-    Y_ENSURE(!script.statements().empty(), "Empty SyntaxScript");
+    RequireStage(!script.statements().empty(), "Empty SyntaxScript");
     if (script.has_directives()) {
         auto directivesScope = budget.Enter(script.directives());
-        Y_ENSURE(!script.directives().explicit_ansi_lexer() || script.lexer_mode() == Metadata::ANSI,
+        RequireStage(!script.directives().explicit_ansi_lexer() || script.lexer_mode() == Metadata::ANSI,
             "SyntaxScript ANSI directive disagrees with the effective lexer mode");
     }
 

@@ -75,6 +75,20 @@ def test_measurement_boundary(tmp_path):
     stages = ("text", "antlr_ast", "antlr_cst", "script", "native_query")
     inputs = [tmp_path / (stage + ".pb") for stage in stages]
     subprocess.run([tool, "--catalog", catalog, "--template", template, "--export", sql, *inputs], check=True)
+    checked = subprocess.run(
+        [tool, "--catalog", catalog, "--check-request", inputs[-1]], capture_output=True, text=True, check=True
+    )
+    assert "BENCH_ROUTE=native_query" in checked.stdout
+    checked_schema = [line for line in checked.stderr.splitlines() if line.startswith("BENCH_RESULT_COLUMNS=")]
+    stale_catalog = tmp_path / "stale.json"
+    stale = json.loads(catalog.read_text())
+    stale["tables"][0]["schema_version"] += 1
+    stale_catalog.write_text(json.dumps(stale))
+    failed = subprocess.run(
+        [tool, "--catalog", stale_catalog, "--check-request", inputs[-1]], capture_output=True, text=True
+    )
+    assert failed.returncode == 1 and "BENCH_ROUTE=" not in failed.stdout
+    assert "NativeQuery table identity or schema changed" in failed.stderr
     stock = subprocess.run(
         [tool, "--catalog", catalog, "--host-text", "0", "2", inputs[0]], capture_output=True, text=True, check=True
     )
@@ -85,6 +99,7 @@ def test_measurement_boundary(tmp_path):
         for clock in ("wall_ns", "cpu_ns"):
             assert int(row["total_" + clock]) >= int(row["decode_" + clock]) >= 0
     schemas = [json.loads(line.split("=", 1)[1]) for line in stock.stderr.splitlines() if line.startswith("BENCH_RESULT_COLUMNS=")]
+    assert [json.loads(line.split("=", 1)[1]) for line in checked_schema] == schemas
     assert len(schemas) == 1 and len(schemas[0]) == 1 and len(schemas[0][0]) == 1
     label, field_type = schemas[0][0][0]
     assert label == "payload" and "String" in field_type

@@ -7,12 +7,20 @@ import "ydb/tests/tools/parsed_query_bench/proto/antlr_ast.proto";
 import "ydb/tests/tools/parsed_query_bench/proto/antlr_cst.proto";
 import "ydb/tests/tools/parsed_query_bench/proto/syntax_script.proto";
 import "ydb/tests/tools/parsed_query_bench/proto/native_query.proto";
+import "ydb/tests/tools/parsed_query_bench/proto/main_stages.proto";
 
 message ParsedQuery {
+  string sql_for_fallback = 1;
+
   oneof stage {
-    SqlV1ParserAst antlr_ast = 1;
-    AntlrCst antlr_cst = 2;
-    SyntaxScript script = 3;
-    NativeQuery native_query = 4;
+    // NewParser
+    SqlV1ParserAst antlr_ast = 2;
+    AntlrCst antlr_cst = 3;
+    SyntaxScript script = 4;
+    NativeQuery native_query = 5;
+    // main
+    YqlAst yql_ast = 6;
+    KqlQueryList kql_query_list = 7;
+    MainSqlV1ParserAst main_antlr_ast = 8;
   }
 }

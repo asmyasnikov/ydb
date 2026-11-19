@@ -27,6 +27,28 @@ bench=ydb/tests/tools/parsed_query_bench/native/parsed_query_native_bench
 ./ya make --threads=5 --build relwithdebinfo -tA ydb/tests/tools/parsed_query_bench/native/ut
 ```
 
+## Fallback and prepared requests
+
+Structured exports include the original YQL in `parsed_query.sql_for_fallback`.
+Pass `--without-sql-fallback` before `--export` or `--client` to omit it.
+Regenerate inputs written with the older prototype, which used different stage numbers.
+
+```sh
+"$bench" --check-request REQUEST.pb
+"$bench" --bench-fallback 30 300 TEXT.pb PARSED.pb
+"$bench" --client-ready 30 300 REQUEST.pb...
+```
+
+`--check-request` reports the selected route and ordered result columns after
+reaching the RBO roots. A missing or unsupported stage, incompatible format or grammar, and explicitly
+recognized wire-shape errors can use nonempty fallback SQL. Catalog binding,
+parameter binding and resource-limit errors propagate. Envelope validation, text parsing, name and type
+resolution after syntax import, and runner errors propagate. The fallback timing
+requires matching reference SQL and request settings and labels its samples
+`sql_fallback`. Regular verification and benchmark rounds require each input to
+reach the roots through its declared stage. Use `--client-ready` for client
+serialization when the structured representation is already available.
+
 ## Five formats without a catalog
 
 ```sh
