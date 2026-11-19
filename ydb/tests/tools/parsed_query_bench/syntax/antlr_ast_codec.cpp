@@ -1,5 +1,6 @@
 #include "antlr_ast_codec.h"
 #include "cst_codec.h"
+#include <ydb/tests/tools/parsed_query_bench/syntax/antlr_ast_fingerprint.h>
 
 #include <ydb/core/kqp/host/new_parser/grammar/default/SQLv1Antlr4Parser.h>
 #include <ydb/core/kqp/host/new_parser/kqp_ast_builder.h>
@@ -213,6 +214,7 @@ SqlV1ParserAst ExportAntlrAst(const TString& sql, NSQLTranslation::TTranslationS
     SqlV1ParserAst result;
     result.set_format_version(FormatVersion);
     *result.mutable_metadata() = PrepareParserMetadata(sql, settings);
+    result.mutable_metadata()->set_grammar_fingerprint(AntlrAstFingerprint, 32);
     if (settings.AnsiLexer) {
         ParseAndExport<NALPAnsiAntlr4::SQLv1Antlr4Lexer, NALPAnsiAntlr4::SQLv1Antlr4Parser>(sql, settings, result);
     } else {
@@ -224,7 +226,7 @@ SqlV1ParserAst ExportAntlrAst(const TString& sql, NSQLTranslation::TTranslationS
 std::unique_ptr<NNewYql::TScript> ImportAntlrAst(const SqlV1ParserAst& input) {
     CheckFields(input);
     Check(input.format_version() == FormatVersion && input.has_metadata() && input.has_ast(), "invalid envelope");
-    auto imported = ImportParserTokens(input.metadata(), input.tokens());
+    auto imported = ImportParserTokens(input.metadata(), input.tokens(), std::string_view(AntlrAstFingerprint, 32));
     TProtoCst tree(imported.Tokens);
     auto& root = tree.Restore(input.ast());
     ValidateAntlrRuleShapes(root, imported.AnsiLexer);

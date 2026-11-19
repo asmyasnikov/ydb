@@ -385,7 +385,6 @@ YqlParserMetadata PrepareParserMetadata(const TString& sql, NSQLTranslation::TTr
         "invalid query directives");
     Check(!settings.PgParser && settings.SyntaxVersion == 1 && !settings.Syntax, "expected YQL syntax v1");
     YqlParserMetadata metadata;
-    metadata.set_grammar_fingerprint(GrammarFingerprint, 32);
     metadata.set_source_name(settings.File);
     metadata.set_lexer_mode(settings.AnsiLexer ? YqlParserMetadata::ANSI : YqlParserMetadata::DEFAULT);
     metadata.mutable_directives()->set_explicit_syntax_v1(parsed.HasSyntaxV1);
@@ -425,6 +424,7 @@ AntlrCst ExportAntlrCst(const TString& sql, NSQLTranslation::TTranslationSetting
     AntlrCst result;
     result.set_format_version(FormatVersion);
     *result.mutable_metadata() = PrepareParserMetadata(sql, settings);
+    result.mutable_metadata()->set_grammar_fingerprint(GrammarFingerprint, 32);
     WithParse(sql, settings, [&](TContext& root, antlr4::CommonTokenStream& tokens) {
         ExportParserTokens(tokens, *result.mutable_tokens());
         result.set_root_node_id(ExportNode(root, result, 1));
@@ -432,10 +432,12 @@ AntlrCst ExportAntlrCst(const TString& sql, NSQLTranslation::TTranslationSetting
     return result;
 }
 
-TImportedParserTokens ImportParserTokens(const YqlParserMetadata& metadata, const TParserTokenFields& tokens) {
+TImportedParserTokens ImportParserTokens(const YqlParserMetadata& metadata, const TParserTokenFields& tokens,
+    std::string_view grammarFingerprint)
+{
     CheckFields(metadata);
     CheckFields(metadata.directives());
-    Check(metadata.grammar_fingerprint() == std::string_view(GrammarFingerprint, 32), "unknown grammar fingerprint");
+    Check(metadata.grammar_fingerprint() == grammarFingerprint, "unknown grammar fingerprint");
     Check(metadata.lexer_mode() == YqlParserMetadata::DEFAULT || metadata.lexer_mode() == YqlParserMetadata::ANSI,
         "unsupported lexer mode");
     const bool ansi = metadata.lexer_mode() == YqlParserMetadata::ANSI;
@@ -473,7 +475,7 @@ std::unique_ptr<NNewYql::TScript> ImportAntlrCst(const AntlrCst& cst) {
     Check(cst.format_version() == FormatVersion && cst.has_metadata(), "unsupported envelope version");
     Check(cst.nodes_size() > 0 && static_cast<size_t>(cst.nodes_size()) <= MaxNodes, "node limit exceeded");
 
-    auto input = ImportParserTokens(cst.metadata(), cst.tokens());
+    auto input = ImportParserTokens(cst.metadata(), cst.tokens(), std::string_view(GrammarFingerprint, 32));
     TRestore tree(cst, input.Tokens);
     auto& root = tree.Restore(input.AnsiLexer
         ? static_cast<size_t>(NKqpAnsiAntlr4::SQLv1Antlr4Parser::RuleSql_query)

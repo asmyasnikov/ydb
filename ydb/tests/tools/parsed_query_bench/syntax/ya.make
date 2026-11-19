@@ -19,9 +19,24 @@ SET(GRAMMAR_MANIFEST
 )
 RUN_PYTHON3(
     grammar_fingerprint.py
-    ${BINDIR}/grammar_fingerprint.h ${GRAMMAR_MANIFEST}
+    ${BINDIR}/grammar_fingerprint.h GrammarFingerprint ${GRAMMAR_MANIFEST}
     IN ${GRAMMAR_MANIFEST}
     OUT_NOAUTO grammar_fingerprint.h
+)
+
+SET(ANTLR_AST_MANIFEST
+    ${ARCADIA_ROOT}/yql/essentials/sql/v1/SQLv1Antlr4.g.in
+    ${ARCADIA_ROOT}/yql/essentials/parser/proto_ast/gen/v1_antlr4/ya.make
+    ${ARCADIA_ROOT}/yql/essentials/parser/proto_ast/gen/v1_ansi_antlr4/ya.make
+    ${ARCADIA_ROOT}/yql/essentials/parser/proto_ast/org/antlr/v4/tool/templates/codegen/Cpp/Cpp.stg.in
+    ${ARCADIA_ROOT}/yql/essentials/parser/proto_ast/org/antlr/v4/tool/templates/codegen/Cpp/Files.stg.in
+    ${SCHEMA_DIR}/SQLv1Antlr4Parser.proto
+)
+RUN_PYTHON3(
+    grammar_fingerprint.py
+    ${BINDIR}/antlr_ast_fingerprint.h AntlrAstFingerprint ${ANTLR_AST_MANIFEST}
+    IN ${ANTLR_AST_MANIFEST}
+    OUT_NOAUTO antlr_ast_fingerprint.h
 )
 
 PEERDIR(

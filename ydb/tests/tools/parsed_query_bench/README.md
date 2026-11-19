@@ -3,10 +3,10 @@
 Compare the text and structured inputs to the YQL frontend from
 [ydb-platform/ydb#58587](https://github.com/ydb-platform/ydb/pull/58587).
 The wire prototype preserves the fields of `ExecuteQueryRequest`. Field 4
-carries YQL text. Field 5 carries a `ParsedQuery`. NewParser supports
-`antlr_ast` (2), `antlr_cst` (3),
-`script` (4) and `native_query` (5). The common schema also defines the main
-stages `yql_ast` (6), `kql_query_list` (7) and `main_antlr_ast` (8). The experimental
+carries YQL text. Field 5 carries a `ParsedQuery`. Both branches import
+`antlr_ast` (2) with the same generated grammar and token schema. NewParser also
+supports `antlr_cst` (3), `script` (4) and `native_query` (5). The main branch
+also supports `yql_ast` (6) and `kql_query_list` (7). The experimental
 request descriptor lives in the benchmark so that the existing Query Service
 and SDKs continue to use the published descriptor.
 

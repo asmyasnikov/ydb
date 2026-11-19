@@ -657,14 +657,15 @@ void SelfTest() {
         Y_ENSURE(resolve() == "script", "Valid script must take its structured route");
         parsed->mutable_script()->set_format_version(0);
         checkRejected("Unsupported SyntaxScript format version");
-        parsed->mutable_main_antlr_ast();
-        checkRejected("Missing or unsupported ParsedQuery stage");
         parsed->mutable_yql_ast();
         checkRejected("Missing or unsupported ParsedQuery stage");
         parsed->mutable_kql_query_list();
         checkRejected("Missing or unsupported ParsedQuery stage");
         parsed->clear_stage();
         checkRejected("Missing or unsupported ParsedQuery stage");
+        fields->AddLengthDelimited(8, "");
+        checkRejected("Missing or unsupported ParsedQuery stage");
+        fields->DeleteByNumber(8);
         fields->AddLengthDelimited(9, "");
         checkRejected("Missing or unsupported ParsedQuery stage");
 
