@@ -3,6 +3,7 @@ PROGRAM(parsed_query_native_bench)
 SRCS(
     catalog.cpp
     host_text.cpp
+    logical_signature.cpp
     main.cpp
     native_codec.cpp
 )

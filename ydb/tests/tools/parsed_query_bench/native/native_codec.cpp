@@ -20,6 +20,7 @@ namespace NKikimr::NKqp::NParsedQueryBench {
 namespace {
 
 using P = Ydb::Query::NativeQuery;
+using L = Ydb::Query::LogicalPlan;
 
 constexpr TStringBuf SemanticsVersion = "kqp-new-parser-721425cc-v1";
 constexpr size_t MaxNodes = 1024;
@@ -377,10 +378,11 @@ private:
 
 class TPlanWriter {
 public:
-    TPlanWriter(P& query, P::Plan& plan, TTableWriter& tables)
+    TPlanWriter(P& query, P::Plan& plan, TTableWriter& tables, L::Graph* logical)
         : Query(query)
         , Plan(plan)
         , Tables(tables)
+        , Logical(logical)
     {}
 
     void Write(const TOpRoot& root) {
@@ -393,11 +395,14 @@ public:
             const auto& source = registry.Get(id);
             auto* unit = Plan.add_information_units();
             unit->set_id(id + 1);
+            if (Logical) {
+                Logical->add_information_units()->set_id(id + 1);
+            }
             const auto alias = source.GetAlias();
             const auto column = source.GetColumnName();
             unit->set_alias(alias.data(), alias.size());
             unit->set_column_name(column.data(), column.size());
-            if (registry.IsGenerated(id)) {
+            if (!Logical && registry.IsGenerated(id)) {
                 const TString prefix = column.StartsWith("aggregate_argument") ? "aggregate_argument" : "aggregate";
                 Y_ENSURE(alias.empty() && column == TStringBuilder() << prefix << ++generated[prefix],
                     "Unsupported generated NativeQuery IU: " << column);
@@ -408,6 +413,13 @@ public:
     }
 
 private:
+    bool Define(TInfoUnitId id, const TTypeAnnotationNode* type) {
+        if (Logical) {
+            Logical->mutable_information_units(id)->set_defined_type_id(TypeId(Query, *type));
+        }
+        return UnitTypes.emplace(id, type).second;
+    }
+
     ui32 WriteExpression(const TExprNode& expression, size_t depth) {
         Y_ENSURE(depth < MaxExpressionDepth, "NativeQuery expression nesting limit exceeded");
         if (const auto* existing = ExpressionIds.FindPtr(&expression)) {
@@ -505,13 +517,13 @@ private:
                 for (const auto& column : metadata.Columns) {
                     columns.emplace(column.Name, &column);
                 }
-                Y_ENSURE(read.GetColumns().Size() == metadata.Columns.size(), "Expected the complete NativeQuery scan schema");
+                Y_ENSURE(Logical || read.GetColumns().Size() == metadata.Columns.size(), "Expected the complete NativeQuery scan schema");
                 THashSet<ui32> seen;
                 for (const auto id : read.GetColumns()) {
                     const auto& unit = Registry->Get(id);
                     const auto* metadataColumn = columns.FindPtr(unit.GetColumnName());
                     Y_ENSURE(metadataColumn && unit.GetAlias() == read.Alias && seen.insert((*metadataColumn)->Id).second
-                        && UnitTypes.emplace(id, Tables.TypeOf(**metadataColumn)).second, "Invalid NativeQuery read binding");
+                        && Define(id, Tables.TypeOf(**metadataColumn)), "Invalid NativeQuery read binding");
                     auto* column = node->add_columns();
                     column->set_column_id((*metadataColumn)->Id);
                     column->set_output_iu_id(id + 1);
@@ -546,7 +558,7 @@ private:
                         }
                     }
                     Y_ENSURE(type, "NativeQuery Map expression has no type");
-                    Y_ENSURE(UnitTypes.emplace(id, type).second, "Duplicate NativeQuery IU definition");
+                    Y_ENSURE(Define(id, type), "Duplicate NativeQuery IU definition");
                 }
                 break;
             }
@@ -577,7 +589,7 @@ private:
                     binding->set_function_id(FunctionId(Query, trait.AggFunction, P::Function::AGGREGATE));
                     binding->set_distinct(trait.Distinct);
                     const auto* type = Tables.TypeContext().MakeType<TDataExprType>(EDataSlot::Uint64);
-                    Y_ENSURE(UnitTypes.emplace(id, type).second, "Duplicate NativeQuery COUNT output IU");
+                    Y_ENSURE(Define(id, type), "Duplicate NativeQuery COUNT output IU");
                 }
                 break;
             }
@@ -631,6 +643,7 @@ private:
     P& Query;
     P::Plan& Plan;
     TTableWriter& Tables;
+    L::Graph* Logical;
     const TInfoUnitRegistry* Registry = nullptr;
     THashSet<const IOperator*> Operators;
     TUnitTypes UnitTypes;
@@ -688,42 +701,40 @@ struct TOperatorEntry {
     size_t Depth;
 };
 
+struct TNativeReadBindings {
+    const TVector<TBoundTable>& Tables;
+    THashSet<ui32>& ReadTables;
+};
+
+struct TLogicalReadBindings {
+    const L::Graph& Graph;
+    THashSet<TString>& ReadPaths;
+};
+
+template <class TBindings>
 class TPlanReader {
 public:
     TPlanReader(TExprContext& ctx, const TVector<const TTypeAnnotationNode*>& types, const TVector<const P::Function*>& functions,
         const TParameterTypes& parameters, THashSet<TString>& usedParameters, const TOfflineCatalog* catalog,
-        const TVector<TBoundTable>& tables, THashSet<ui32>& readTables)
+        TBindings bindings)
         : Ctx(ctx)
         , Types(types)
         , Functions(functions)
         , Parameters(parameters)
         , UsedParameters(usedParameters)
         , Catalog(catalog)
-        , Tables(tables)
-        , ReadTables(readTables)
+        , Bindings(bindings)
     {}
 
-    TIntrusivePtr<TOpRoot> Read(const P::Root& root, ui32 position, TVector<const TTypeAnnotationNode*>* resultTypes) {
-        const auto& plan = root.plan();
+    template <class TRoot, class TGraph>
+    TIntrusivePtr<TOpRoot> Read(const TRoot& root, const TGraph& plan, ui32 position, TVector<const TTypeAnnotationNode*>* resultTypes) {
         CheckFields(plan);
-        Y_ENSURE(plan.subplans().empty() && plan.replicate_hubs_size() <= plan.operators_size()
+        Y_ENSURE(plan.replicate_hubs_size() <= plan.operators_size()
             && static_cast<size_t>(plan.information_units_size()) <= MaxInformationUnits
             && static_cast<size_t>(plan.expressions_size()) <= MaxExpressions
             && static_cast<size_t>(plan.operators_size()) <= MaxNodes && !plan.operators().empty(),
-            "Unsupported NativeQuery plan size or features");
-        for (const auto& iu : plan.information_units()) {
-            CheckFields(iu);
-            Y_ENSURE(iu.id() == Props.InfoUnitRegistry.Size() + 1, "Invalid NativeQuery IU registry");
-            if (iu.has_generated_name_prefix()) {
-                const auto& prefix = iu.generated_name_prefix();
-                Y_ENSURE(iu.alias().empty() && IsGeneratedAggregatePrefix(prefix), "Unsupported generated NativeQuery IU");
-                const auto id = Props.InfoUnitRegistry.AddGenerated(prefix);
-                Y_ENSURE(Props.InfoUnitRegistry.Get(id).GetColumnName() == iu.column_name(),
-                    "Generated NativeQuery IU name does not match its canonical prefix and ordinal");
-            } else {
-                Props.InfoUnitRegistry.Add(TInfoUnit(CopyString(iu.alias()), CopyString(iu.column_name())));
-            }
-        }
+            "Unsupported plan size or features");
+        ReadUnits(plan);
         for (const auto& expression : plan.expressions()) {
             ReadExpression(expression);
         }
@@ -759,13 +770,22 @@ public:
             }
         }
         TVector<TString> queryColumns;
-        for (const auto& name : root.query_columns()) {
-            queryColumns.push_back(CopyString(name));
+        bool unordered;
+        if constexpr (std::is_same_v<TRoot, L::Root>) {
+            for (const auto& column : root.columns()) {
+                queryColumns.push_back(CopyString(column.name()));
+            }
+            unordered = !root.ordered_rows();
+        } else {
+            for (const auto& name : root.query_columns()) {
+                queryColumns.push_back(CopyString(name));
+            }
+            unordered = root.unordered_result();
         }
         auto result = MakeIntrusive<TOpRoot>(std::move(input), TPositionHandle(), std::move(columns), std::move(queryColumns));
         result->PlanProps = std::move(Props);
         result->PlanProps.ResultIndex = position;
-        result->PlanProps.UnorderedResult = root.unordered_result();
+        result->PlanProps.UnorderedResult = unordered;
         for (const auto& entry : IterateSubtreeWithSubplans(result.Get(), result->PlanProps)) {
             entry.Current->BindExpressionPlanProps(&result->PlanProps);
         }
@@ -775,6 +795,50 @@ public:
     }
 
 private:
+    void ReadUnits(const P::Plan& plan) {
+        Y_ENSURE(plan.subplans().empty(), "Unsupported NativeQuery subplans");
+        for (const auto& iu : plan.information_units()) {
+            CheckFields(iu);
+            Y_ENSURE(iu.id() == Props.InfoUnitRegistry.Size() + 1, "Invalid NativeQuery IU registry");
+            if (iu.has_generated_name_prefix()) {
+                const auto& prefix = iu.generated_name_prefix();
+                Y_ENSURE(iu.alias().empty() && IsGeneratedAggregatePrefix(prefix), "Unsupported generated NativeQuery IU");
+                const auto id = Props.InfoUnitRegistry.AddGenerated(prefix);
+                Y_ENSURE(Props.InfoUnitRegistry.Get(id).GetColumnName() == iu.column_name(),
+                    "Generated NativeQuery IU name does not match its canonical prefix and ordinal");
+            } else {
+                Props.InfoUnitRegistry.Add(TInfoUnit(CopyString(iu.alias()), CopyString(iu.column_name())));
+            }
+        }
+    }
+
+    void ReadUnits(const L::Graph& graph) {
+        Y_ENSURE(graph.subqueries().empty(), "Unsupported LogicalPlan subqueries");
+        TVector<TString> names(graph.information_units_size());
+        for (const auto& op : graph.operators()) {
+            for (const auto& column : op.read().columns()) {
+                Y_ENSURE(column.iu_id() && column.iu_id() <= names.size(), "Unknown LogicalPlan scan IU");
+                names[column.iu_id() - 1] = CopyString(column.column());
+            }
+        }
+        for (const auto& unit : graph.information_units()) {
+            CheckFields(unit);
+            Y_ENSURE(unit.id() == Props.InfoUnitRegistry.Size() + 1 && unit.defined_type_id() && unit.defined_type_id() <= Types.size(),
+                "Invalid LogicalPlan IU definition");
+            const auto& name = names[unit.id() - 1];
+            Props.InfoUnitRegistry.Add(TInfoUnit("", name.empty() ? ToString(unit.id()) : name));
+        }
+    }
+
+    bool Define(TInfoUnitId id, const TTypeAnnotationNode* type) {
+        if constexpr (std::is_same_v<TBindings, TLogicalReadBindings>) {
+            const auto declared = Bindings.Graph.information_units(id).defined_type_id();
+            Y_ENSURE(declared && declared <= Types.size() && IsSameAnnotation(*type, *Types[declared - 1]),
+                "LogicalPlan IU definition type mismatch");
+        }
+        return UnitTypes.emplace(id, type).second;
+    }
+
     TExpressionEntry& Reference(ui32 id, P::Expression::NodeCase kind) {
         Y_ENSURE(id > 0 && id <= Expressions.size(), "Invalid or forward NativeQuery expression reference");
         auto& entry = Expressions[id - 1];
@@ -947,8 +1011,8 @@ private:
 
     TIntrusivePtr<IOperator> ReadTable(const P::Read& read, TPositionHandle pos) {
         CheckFields(read);
-        Y_ENSURE(Catalog && read.table_id() > 0 && read.table_id() <= Tables.size(), "Unknown NativeQuery read table");
-        const auto& table = Tables[read.table_id() - 1];
+        Y_ENSURE(Catalog && read.table_id() > 0 && read.table_id() <= Bindings.Tables.size(), "Unknown NativeQuery read table");
+        const auto& table = Bindings.Tables[read.table_id() - 1];
         const auto alias = CopyString(read.alias());
         Y_ENSURE(static_cast<size_t>(read.columns_size()) == table.Columns.size(), "Expected the complete NativeQuery scan schema");
         TUnorderedIUs outputs;
@@ -961,12 +1025,37 @@ private:
             const auto id = binding.output_iu_id() - 1;
             const auto& unit = Props.InfoUnitRegistry.Get(id);
             Y_ENSURE(unit.GetAlias() == alias && unit.GetColumnName() == column->Metadata->Name
-                && UnitTypes.emplace(id, column->Type).second, "Invalid NativeQuery scan binding");
+                && Define(id, column->Type), "Invalid NativeQuery scan binding");
             outputs.Add(id);
         }
-        ReadTables.insert(read.table_id());
+        Bindings.ReadTables.insert(read.table_id());
         const auto bound = Catalog->Lookup(Ctx, *table.Metadata);
         return MakeIntrusive<TOpRead>(alias, std::move(outputs), bound.StorageType, bound.Table,
+            nullptr, nullptr, std::nullopt, std::nullopt, ESortDir::None, TPhysicalOpProps{}, pos);
+    }
+
+    TIntrusivePtr<IOperator> ReadTable(const L::Read& read, TPositionHandle pos) {
+        CheckFields(read);
+        Y_ENSURE(Catalog, "LogicalPlan reads require a catalog");
+        const auto metadata = Catalog->Resolve(Catalog->NameSettings().DefaultCluster, CopyString(read.table_path()));
+        THashMap<TString, const TColumnMetadata*> columns;
+        for (const auto& column : metadata->Columns) {
+            columns.emplace(column.Name, &column);
+        }
+        TUnorderedIUs outputs;
+        for (const auto& binding : read.columns()) {
+            CheckFields(binding);
+            const auto it = columns.find(binding.column());
+            Y_ENSURE(it != columns.end() && binding.iu_id() && binding.iu_id() <= Props.InfoUnitRegistry.Size(),
+                "Invalid LogicalPlan scan binding");
+            const auto id = binding.iu_id() - 1;
+            Y_ENSURE(Define(id, ColumnType(Ctx, *it->second)), "Duplicate LogicalPlan scan IU");
+            outputs.Add(id);
+            columns.erase(it);
+        }
+        Bindings.ReadPaths.insert(metadata->Path);
+        const auto bound = Catalog->Lookup(Ctx, *metadata);
+        return MakeIntrusive<TOpRead>("", std::move(outputs), bound.StorageType, bound.Table,
             nullptr, nullptr, std::nullopt, std::nullopt, ESortDir::None, TPhysicalOpProps{}, pos);
     }
 
@@ -976,21 +1065,30 @@ private:
         return std::move(Operators[id - 1]);
     }
 
-    TIntrusivePtr<IOperator> ReadOperator(const P::Operator& op, size_t& depth) {
+    static const P::EmptySource* Rows(const P::Operator& op) {
+        return op.has_empty_source() ? &op.empty_source() : nullptr;
+    }
+
+    static const P::EmptySource* Rows(const L::Operator& op) {
+        return op.has_rows() ? &op.rows() : nullptr;
+    }
+
+    template <class TOperator>
+    TIntrusivePtr<IOperator> ReadOperator(const TOperator& op, size_t& depth) {
         CheckFields(op);
-        Y_ENSURE(!op.has_location(), "Unsupported NativeQuery operator location");
+        if constexpr (std::is_same_v<TOperator, P::Operator>) {
+            Y_ENSURE(!op.has_location(), "Unsupported NativeQuery operator location");
+        }
         TPositionHandle pos;
+        if (const auto* rows = Rows(op)) {
+            CheckFields(*rows);
+            Y_ENSURE(!rows->has_rows_expr_id() && rows->columns().empty(), "Unsupported non-unit rows source");
+            return MakeIntrusive<TOpEmptySource>(pos);
+        }
         switch (op.node_case()) {
-            case P::Operator::kEmptySource: {
-                const auto& source = op.empty_source();
-                CheckFields(source);
-                Y_ENSURE(!source.has_rows_expr_id() && source.columns().empty(),
-                    "Unsupported NativeQuery empty source");
-                return MakeIntrusive<TOpEmptySource>(pos);
-            }
-            case P::Operator::kRead:
+            case TOperator::kRead:
                 return ReadTable(op.read(), pos);
-            case P::Operator::kMap: {
+            case TOperator::kMap: {
                 const auto& map = op.map();
                 CheckFields(map);
                 Y_ENSURE(!map.definitions().empty() && static_cast<size_t>(map.definitions_size()) <= Props.InfoUnitRegistry.Size(),
@@ -1004,23 +1102,23 @@ private:
                     Y_ENSURE(id > 0 && id <= Props.InfoUnitRegistry.Size(), "Invalid NativeQuery map output IU");
                     const auto& lambda = Reference(definition.lambda_expr_id(), P::Expression::kLambda);
                     const auto* type = LambdaType(lambda, *input);
-                    Y_ENSURE(UnitTypes.emplace(id - 1, type).second, "Duplicate NativeQuery IU definition");
+                    Y_ENSURE(Define(id - 1, type), "Duplicate NativeQuery IU definition");
                     definitions.Add(id - 1, TExpression(lambda.Node, &Ctx));
                 }
                 return MakeIntrusive<TOpMap>(std::move(input), pos, std::move(definitions));
             }
-            case P::Operator::kFilter: {
+            case TOperator::kFilter: {
                 const auto& filter = op.filter();
                 CheckFields(filter);
                 auto [input, childDepth] = TakeOperator(filter.input());
                 depth = childDepth + 1;
                 const auto& lambda = Reference(filter.predicate_lambda_expr_id(), P::Expression::kLambda);
-                const auto& item = OptionalItemType(*LambdaType(lambda, *input));
+                const TTypeAnnotationNode& item = OptionalItemType(*LambdaType(lambda, *input));
                 Y_ENSURE(item.GetKind() == ETypeAnnotationKind::Data && item.Cast<TDataExprType>()->GetSlot() == EDataSlot::Bool,
                     "Non-boolean NativeQuery predicate");
                 return MakeIntrusive<TOpFilter>(std::move(input), pos, TExpression(lambda.Node, &Ctx));
             }
-            case P::Operator::kAggregate: {
+            case TOperator::kAggregate: {
                 const auto& aggregate = op.aggregate();
                 CheckFields(aggregate);
                 Y_ENSURE(aggregate.key_iu_ids().empty() && !aggregate.distinct_all() && !aggregate.aggregations().empty()
@@ -1039,13 +1137,13 @@ private:
                         "Unsupported NativeQuery aggregate function or output IU");
                     const auto inputId = AvailableUnit(item.input_iu_id(), *input);
                     Y_ENSURE(IsCountInput(*UnitTypes.at(inputId), item.distinct()), "Unsupported NativeQuery COUNT input");
-                    Y_ENSURE(UnitTypes.emplace(id - 1, type).second, "Duplicate NativeQuery COUNT output IU");
+                    Y_ENSURE(Define(id - 1, type), "Duplicate NativeQuery COUNT output IU");
                     traits.Add(id - 1, TOpAggregationTraits{inputId, "count", item.distinct()});
                 }
                 return MakeIntrusive<TOpAggregate>(std::move(input), std::move(traits), TOrderedIUs<>{},
                     EOpPhase::Undefined, false, pos);
             }
-            case P::Operator::kJoin: {
+            case TOperator::kJoin: {
                 const auto& join = op.join();
                 CheckFields(join);
                 auto kind = ReadJoinKind(join.kind());
@@ -1070,7 +1168,7 @@ private:
                 }
                 return MakeIntrusive<TOpJoin>(std::move(left), std::move(right), pos, std::move(kind), std::move(keys));
             }
-            case P::Operator::kReplicatePort: {
+            case TOperator::kReplicatePort: {
                 const auto& port = op.replicate_port();
                 CheckFields(port);
                 const auto id = port.hub_id();
@@ -1093,8 +1191,7 @@ private:
     const TParameterTypes& Parameters;
     THashSet<TString>& UsedParameters;
     const TOfflineCatalog* Catalog;
-    const TVector<TBoundTable>& Tables;
-    THashSet<ui32>& ReadTables;
+    TBindings Bindings;
     TPlanProps Props;
     TVector<TExpressionEntry> Expressions;
     TVector<TOperatorEntry> Operators;
@@ -1105,10 +1202,8 @@ private:
     TTypeAnnotationContextPtr AnnotationContext;
 };
 
-} // namespace
-
-P ExportNativeQuery(const TNativeQuery& query, const TNativeSourceOrdinals& source, const TOfflineCatalog* catalog,
-    const TNativeParameters* parameters)
+P WriteNative(const TNativeQuery& query, const TNativeSourceOrdinals& source, const TOfflineCatalog* catalog,
+    const TNativeParameters* parameters, L* logical)
 {
     Y_ENSURE(!query.Roots.empty() && query.Roots.size() <= MaxNodes && query.Roots.size() == query.Results.size()
         && query.Roots.size() == query.Execution.DiscardResults.size()
@@ -1134,7 +1229,7 @@ P ExportNativeQuery(const TNativeQuery& query, const TNativeSourceOrdinals& sour
         wire->set_statement_index(source.Statements[i]);
         wire->set_result_id(i + 1);
         wire->set_unordered_result(props.UnorderedResult);
-        TPlanWriter(output, *wire->mutable_plan(), tables).Write(root);
+        TPlanWriter(output, *wire->mutable_plan(), tables, logical ? logical->add_roots()->mutable_graph() : nullptr).Write(root);
         for (const auto& [id, name] : root.GetColumns().Items()) {
             auto* column = wire->add_columns();
             column->set_iu_id(id + 1);
@@ -1165,20 +1260,16 @@ P ExportNativeQuery(const TNativeQuery& query, const TNativeSourceOrdinals& sour
     return output;
 }
 
-std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ctx, const TOfflineCatalog* catalog,
-    TNativeResultTypes* resultTypes, const TNativeParameters* parameters)
-{
-    CheckFields(query);
-    Y_ENSURE(query.format_version() == 1 && TStringBuf(query.semantics_version()) == SemanticsVersion,
-        "Unsupported NativeQuery format or semantics version");
-    Y_ENSURE(query.required_features().empty() && !query.has_context() && !query.has_diagnostics()
-        && !query.roots().empty() && static_cast<size_t>(query.parameters_size()) <= MaxInformationUnits
-        && static_cast<size_t>(query.roots_size()) <= MaxNodes && query.roots_size() == query.results_size(),
-        "Unsupported NativeQuery context or execution shape");
-    CheckFields(query.execution());
-    Y_ENSURE(!query.execution().has_uncommitted_changes_read(), "Unsupported NativeQuery uncommitted reads");
-    TVector<const TTypeAnnotationNode*> types;
-    TVector<const P::Function*> functions;
+struct TRegistries {
+    TVector<const TTypeAnnotationNode*> Types;
+    TVector<const P::Function*> Functions;
+    TParameterTypes Parameters;
+};
+
+template <class TQuery>
+TRegistries ReadRegistries(const TQuery& query, TExprContext& ctx, const TNativeParameters* parameters) {
+    TRegistries result;
+    auto& [types, functions, boundParameters] = result;
     TVector<size_t> typeDepths;
     Y_ENSURE(static_cast<size_t>(query.types_size()) <= MaxNodes && query.functions_size() <= 64,
         "Unsupported NativeQuery function or type registry size");
@@ -1236,7 +1327,6 @@ std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ct
     }
 
     const auto requestTypes = parameters ? MakeOfflineTypeSettings(*parameters, ctx).Parameters : TParameterTypes{};
-    TParameterTypes boundParameters;
     for (const auto& parameter : query.parameters()) {
         CheckFields(parameter);
         const auto name = CopyString(parameter.name());
@@ -1245,6 +1335,24 @@ std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ct
         Y_ENSURE(bound && id > 0 && id <= types.size() && IsSameAnnotation(**bound, *types[id - 1])
             && boundParameters.emplace(name, *bound).second, "NativeQuery parameter type differs from the request");
     }
+    return result;
+}
+
+} // namespace
+
+std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ctx, const TOfflineCatalog* catalog,
+    TNativeResultTypes* resultTypes, const TNativeParameters* parameters)
+{
+    CheckFields(query);
+    Y_ENSURE(query.format_version() == 1 && TStringBuf(query.semantics_version()) == SemanticsVersion,
+        "Unsupported NativeQuery format or semantics version");
+    Y_ENSURE(query.required_features().empty() && !query.has_context() && !query.has_diagnostics()
+        && !query.roots().empty() && static_cast<size_t>(query.parameters_size()) <= MaxInformationUnits
+        && static_cast<size_t>(query.roots_size()) <= MaxNodes && query.roots_size() == query.results_size(),
+        "Unsupported NativeQuery context or execution shape");
+    CheckFields(query.execution());
+    Y_ENSURE(!query.execution().has_uncommitted_changes_read(), "Unsupported NativeQuery uncommitted reads");
+    const auto [types, functions, boundParameters] = ReadRegistries(query, ctx, parameters);
     THashSet<TString> usedParameters;
 
     auto output = std::make_shared<TNativeQuery>();
@@ -1265,8 +1373,8 @@ std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ct
             && !root.has_returning_rows_limit_expr_id() && root.columns_size() > 0 && static_cast<size_t>(root.columns_size()) <= MaxInformationUnits
             && static_cast<size_t>(root.query_columns_size()) <= MaxInformationUnits && static_cast<size_t>(result.column_hints_size()) <= MaxInformationUnits,
             "Unsupported NativeQuery result contract");
-        auto importedRoot = TPlanReader(ctx, types, functions, boundParameters, usedParameters, catalog, tables, readTables)
-            .Read(root, index, resultTypes ? &outputTypes.emplace_back() : nullptr);
+        auto importedRoot = TPlanReader(ctx, types, functions, boundParameters, usedParameters, catalog,
+            TNativeReadBindings{tables, readTables}).Read(root, root.plan(), index, resultTypes ? &outputTypes.emplace_back() : nullptr);
         TVector<TString> hints;
         for (const auto& hint : result.column_hints()) {
             hints.push_back(CopyString(hint));
@@ -1292,6 +1400,102 @@ std::shared_ptr<TNativeQuery> ImportNativeQuery(const P& query, TExprContext& ct
         *resultTypes = std::move(outputTypes);
     }
     return output;
+}
+
+P ExportNativeQuery(const TNativeQuery& query, const TNativeSourceOrdinals& source, const TOfflineCatalog* catalog,
+    const TNativeParameters* parameters)
+{
+    return WriteNative(query, source, catalog, parameters, nullptr);
+}
+
+L ExportLogicalPlan(const TNativeQuery& query, const TNativeSourceOrdinals& source, const TOfflineCatalog* catalog,
+    const TNativeParameters* parameters)
+{
+    L logical;
+    logical.set_version(1);
+    auto native = WriteNative(query, source, catalog, parameters, &logical);
+    logical.mutable_types()->Swap(native.mutable_types());
+    logical.mutable_functions()->Swap(native.mutable_functions());
+    logical.mutable_parameters()->Swap(native.mutable_parameters());
+    for (int i = 0; i < native.roots_size(); ++i) {
+        auto& root = *native.mutable_roots(i);
+        auto& dest = *logical.mutable_roots(i);
+        dest.set_id(root.id());
+        dest.set_statement_index(root.statement_index());
+        dest.set_result_index(i);
+        dest.mutable_columns()->Swap(root.mutable_columns());
+        auto& src = *root.mutable_plan();
+        auto& graph = *dest.mutable_graph();
+        graph.set_input_operator_id(src.input_operator_id());
+        graph.mutable_expressions()->Swap(src.mutable_expressions());
+        graph.mutable_replicate_hubs()->Swap(src.mutable_replicate_hubs());
+        for (auto& op : *src.mutable_operators()) {
+            auto& node = *graph.add_operators();
+            node.set_id(op.id());
+            switch (op.node_case()) {
+                case P::Operator::kEmptySource: node.mutable_rows()->Swap(op.mutable_empty_source()); break;
+                case P::Operator::kMap: node.mutable_map()->Swap(op.mutable_map()); break;
+                case P::Operator::kFilter: node.mutable_filter()->Swap(op.mutable_filter()); break;
+                case P::Operator::kJoin: node.mutable_join()->Swap(op.mutable_join()); break;
+                case P::Operator::kAggregate: node.mutable_aggregate()->Swap(op.mutable_aggregate()); break;
+                case P::Operator::kReplicatePort: node.mutable_replicate_port()->Swap(op.mutable_replicate_port()); break;
+                case P::Operator::kRead: {
+                    const auto& read = op.read();
+                    const auto& table = native.tables(read.table_id() - 1);
+                    auto* out = node.mutable_read();
+                    out->set_table_path(table.path());
+                    for (const auto& binding : read.columns()) {
+                        auto* column = out->add_columns();
+                        const auto& iu = src.information_units(binding.output_iu_id() - 1);
+                        column->set_column(iu.column_name());
+                        column->set_iu_id(binding.output_iu_id());
+                    }
+                    break;
+                }
+                default: ythrow yexception() << "Unsupported LogicalPlan export operator";
+            }
+        }
+    }
+    return logical;
+}
+
+std::shared_ptr<TNativeQuery> ImportLogicalPlan(const L& logical, TExprContext& ctx, const TOfflineCatalog* catalog,
+    TNativeResultTypes* resultTypes, const TNativeParameters* parameters)
+{
+    CheckFields(logical);
+    Y_ENSURE(logical.version() == 1 && logical.required_features().empty(), "Unsupported LogicalPlan version or features");
+    Y_ENSURE(logical.roots_size() > 0 && static_cast<size_t>(logical.roots_size()) <= MaxNodes
+        && static_cast<size_t>(logical.types_size()) <= MaxNodes, "Unsupported LogicalPlan size");
+    Y_ENSURE(static_cast<size_t>(logical.parameters_size()) <= MaxInformationUnits, "Too many LogicalPlan parameters");
+    const auto [types, functions, boundParameters] = ReadRegistries(logical, ctx, parameters);
+    THashSet<TString> usedParameters;
+    THashSet<TString> readPaths;
+    auto result = std::make_shared<TNativeQuery>();
+    TNativeResultTypes outputTypes;
+    for (int i = 0; i < logical.roots_size(); ++i) {
+        const auto& root = logical.roots(i);
+        CheckFields(root);
+        Y_ENSURE(root.id() == static_cast<ui32>(i + 1) && root.has_result_index() && root.result_index() == static_cast<ui32>(i)
+            && root.has_graph() && !root.has_returning_limit_expr_id() && !root.ordered_rows() && root.has_statement_index()
+            && (i == 0 || logical.roots(i - 1).statement_index() < root.statement_index())
+            && root.columns_size() > 0 && static_cast<size_t>(root.columns_size()) <= MaxInformationUnits,
+            "Unsupported LogicalPlan root destination or ordering");
+        auto imported = TPlanReader(ctx, types, functions, boundParameters, usedParameters, catalog,
+            TLogicalReadBindings{root.graph(), readPaths}).Read(root, root.graph(), i, resultTypes ? &outputTypes.emplace_back() : nullptr);
+        result->Results.push_back({imported->GetQueryColumns(), 0});
+        result->Roots.push_back(std::move(imported));
+        result->Execution.DiscardResults.push_back(false);
+    }
+    Y_ENSURE(usedParameters.size() == boundParameters.size(), "Unused LogicalPlan parameter declaration");
+    for (const auto& path : readPaths) {
+        auto& read = result->Execution.TableOperations.emplace_back();
+        read.SetTable(path);
+        read.SetOperation(static_cast<ui32>(TYdbOperation::Select));
+    }
+    if (resultTypes) {
+        *resultTypes = std::move(outputTypes);
+    }
+    return result;
 }
 
 } // namespace NKikimr::NKqp::NParsedQueryBench

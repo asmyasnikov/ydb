@@ -72,11 +72,11 @@ def test_measurement_boundary(tmp_path):
     parameter.value.int32_value = 1
     template = tmp_path / "template.pb"
     template.write_bytes(request.SerializeToString())
-    stages = ("text", "antlr_ast", "antlr_cst", "script", "native_query")
+    stages = ("text", "antlr_ast", "antlr_cst", "script", "native_query", "logical_plan")
     inputs = [tmp_path / (stage + ".pb") for stage in stages]
     subprocess.run([tool, "--catalog", catalog, "--template", template, "--export", sql, *inputs], check=True)
     checked = subprocess.run(
-        [tool, "--catalog", catalog, "--check-request", inputs[-1]], capture_output=True, text=True, check=True
+        [tool, "--catalog", catalog, "--check-request", inputs[-2]], capture_output=True, text=True, check=True
     )
     assert "BENCH_ROUTE=native_query" in checked.stdout
     checked_schema = [line for line in checked.stderr.splitlines() if line.startswith("BENCH_RESULT_COLUMNS=")]
@@ -85,10 +85,11 @@ def test_measurement_boundary(tmp_path):
     stale["tables"][0]["schema_version"] += 1
     stale_catalog.write_text(json.dumps(stale))
     failed = subprocess.run(
-        [tool, "--catalog", stale_catalog, "--check-request", inputs[-1]], capture_output=True, text=True
+        [tool, "--catalog", stale_catalog, "--check-request", inputs[-2]], capture_output=True, text=True
     )
     assert failed.returncode == 1 and "BENCH_ROUTE=" not in failed.stdout
     assert "NativeQuery table identity or schema changed" in failed.stderr
+    subprocess.run([tool, "--catalog", stale_catalog, "--verify-import", inputs[0], inputs[-1]], check=True)
     stock = subprocess.run(
         [tool, "--catalog", catalog, "--host-text", "0", "2", inputs[0]], capture_output=True, text=True, check=True
     )
@@ -116,7 +117,7 @@ def test_measurement_boundary(tmp_path):
             assert sum(phases) == int(row["native_query_" + clock])
             assert int(row["runner_" + clock]) > 0
             assert sum(phases) + int(row["runner_" + clock]) == int(row["total_" + clock])
-            if row["stage"] == "native_query":
+            if row["stage"] in ("native_query", "logical_plan"):
                 assert int(row["frontend_" + clock]) == 0
 
 
@@ -150,3 +151,17 @@ def test_unavailable_udf(tmp_path):
     )
     assert result.returncode == 1
     assert "testmissingmodule" in result.stderr.lower()
+
+
+def test_logical_import_rejects_different_literal(tmp_path):
+    tool = yatest.common.binary_path(TOOL)
+    sql = tmp_path / "query.sql"
+    inputs = [tmp_path / (s + ".pb") for s in ("text", "ast", "cst", "script", "native", "logical")]
+    sql.write_text("SELECT 1 AS n")
+    subprocess.run([tool, "--export", sql, *inputs], check=True)
+    reference = tmp_path / "reference.pb"
+    inputs[0].rename(reference)
+    sql.write_text("SELECT 2 AS n")
+    subprocess.run([tool, "--export", sql, *inputs], check=True)
+    result = subprocess.run([tool, "--verify-import", reference, inputs[-1]], capture_output=True, text=True)
+    assert result.returncode == 1 and "LogicalPlan differs from text" in result.stderr

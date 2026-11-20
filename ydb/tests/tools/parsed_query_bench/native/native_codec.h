@@ -2,7 +2,7 @@
 
 #include <ydb/core/kqp/opt/rbo/kqp_native_query.h>
 #include <ydb/public/api/protos/ydb_value.pb.h>
-#include <ydb/tests/tools/parsed_query_bench/proto/native_query.pb.h>
+#include <ydb/tests/tools/parsed_query_bench/proto/logical_plan.pb.h>
 
 namespace NKikimr::NKqp::NParsedQueryBench {
 
@@ -21,5 +21,12 @@ Ydb::Query::NativeQuery ExportNativeQuery(const TNativeQuery& query, const TNati
 std::shared_ptr<TNativeQuery> ImportNativeQuery(const Ydb::Query::NativeQuery& query,
     NYql::TExprContext& ctx, const TOfflineCatalog* catalog = nullptr, TNativeResultTypes* resultTypes = nullptr,
     const TNativeParameters* parameters = nullptr);
+
+Ydb::Query::LogicalPlan ExportLogicalPlan(const TNativeQuery& query, const TNativeSourceOrdinals& source,
+    const TOfflineCatalog* catalog, const TNativeParameters* parameters);
+std::shared_ptr<TNativeQuery> ImportLogicalPlan(const Ydb::Query::LogicalPlan& query, NYql::TExprContext& ctx,
+    const TOfflineCatalog* catalog, TNativeResultTypes* resultTypes, const TNativeParameters* parameters);
+
+TString LogicalSignature(TOpRoot& root);
 
 } // namespace NKikimr::NKqp::NParsedQueryBench

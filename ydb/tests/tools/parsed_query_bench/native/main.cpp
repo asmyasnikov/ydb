@@ -48,10 +48,10 @@ namespace {
 
 using TRequest = Ydb::Query::Benchmark::ExecuteQueryRequest;
 
-enum class EStage { Text, AntlrAst, AntlrCst, Script, NativeQuery, Count };
+enum class EStage { Text, AntlrAst, AntlrCst, Script, NativeQuery, LogicalPlan, Count };
 
 constexpr std::array<TStringBuf, static_cast<size_t>(EStage::Count)> StageNames = {
-    "text", "antlr_ast", "antlr_cst", "script", "native_query",
+    "text", "antlr_ast", "antlr_cst", "script", "native_query", "logical_plan",
 };
 
 EStage GetStage(const TRequest& request) {
@@ -64,6 +64,7 @@ EStage GetStage(const TRequest& request) {
         case Ydb::Query::ParsedQuery::kAntlrCst: return EStage::AntlrCst;
         case Ydb::Query::ParsedQuery::kScript: return EStage::Script;
         case Ydb::Query::ParsedQuery::kNativeQuery: return EStage::NativeQuery;
+        case Ydb::Query::ParsedQuery::kLogicalPlan: return EStage::LogicalPlan;
         default:
             ythrow yexception() << "Missing or unsupported ParsedQuery stage";
     }
@@ -112,7 +113,8 @@ TNativeSourceOrdinals SourceOrdinals(const NNewYql::TScript& script) {
     return ordinals;
 }
 
-TNativeSourceOrdinals SourceOrdinals(const Ydb::Query::NativeQuery& query) {
+template <class TBoundPlan>
+TNativeSourceOrdinals SourceOrdinals(const TBoundPlan& query) {
     TNativeSourceOrdinals ordinals;
     for (const auto& root : query.roots()) {
         ordinals.Statements.push_back(root.statement_index());
@@ -157,7 +159,12 @@ std::shared_ptr<TNativeQuery> LowerScript(const NNewYql::TScript& script, TExprC
     const auto names = NNewYql::ResolveNames(script, catalog.NameSettings(),
         [&](const TString& cluster, const TString& path) { return catalog.Resolve(cluster, path); });
     Y_ENSURE(names.IsOk(), names.Issues.ToString());
-    Y_ENSURE(names.Names->ProviderPragmas.empty(), "Offline catalog cannot apply provider configuration pragmas");
+    for (const auto& [pragma, setting] : names.Names->ProviderPragmas) {
+        Y_ENSURE(setting.Provider == "config" && setting.Name == "flags" && !setting.Default
+            && setting.Values == TVector<TString>({"DecimalCommonTypeConversionMode", "with_common_type_fixup"})
+            && types.GetDecimalConversionMode() == NYql::EDecimalConversionMode::WithCommonTypeFixup,
+            "Offline catalog cannot apply provider configuration pragmas");
+    }
     types.UdfResolver = OfflineUdfResolver();
     types.UserDataStorage = MakeIntrusive<NYql::TUserDataStorage>(nullptr, NYql::TUserDataTable(), nullptr, nullptr);
     const auto annotations = NNewYql::AnnotateAst(script, *names.Names, ctx, types, MakeOfflineTypeSettings(parameters, ctx));
@@ -290,13 +297,19 @@ TString Prepare(EStage stage, const TString& text, const TRequest& envelope, con
         case EStage::Script:
             *request.mutable_parsed_query()->mutable_script() = ExportSyntaxScript(text, {});
             break;
-        case EStage::NativeQuery: {
+        case EStage::NativeQuery:
+        case EStage::LogicalPlan: {
             TExprContext ctx;
             TTypeAnnotationContext types;
             const auto script = ParseTextInput(text);
             const auto query = LowerScript(*script, ctx, types, benchmark.Catalog, request.parameters());
-            *request.mutable_parsed_query()->mutable_native_query() =
-                ExportNativeQuery(*query, SourceOrdinals(*script), benchmark.NativeCatalog(), &request.parameters());
+            if (stage == EStage::LogicalPlan) {
+                *request.mutable_parsed_query()->mutable_logical_plan() =
+                    ExportLogicalPlan(*query, SourceOrdinals(*script), benchmark.NativeCatalog(), &request.parameters());
+            } else {
+                *request.mutable_parsed_query()->mutable_native_query() =
+                    ExportNativeQuery(*query, SourceOrdinals(*script), benchmark.NativeCatalog(), &request.parameters());
+            }
             break;
         }
         default:
@@ -327,7 +340,10 @@ std::shared_ptr<TNativeQuery> ToNative(const TRequest& request, EStage stage, TE
     ValidateEnvelope(request);
     std::shared_ptr<TNativeQuery> plan;
     TNativeResultTypes outputTypes;
-    if (stage == EStage::NativeQuery) {
+    if (stage == EStage::LogicalPlan) {
+        plan = ImportLogicalPlan(request.parsed_query().logical_plan(), ctx, benchmark.NativeCatalog(),
+            signature ? &outputTypes : nullptr, &request.parameters());
+    } else if (stage == EStage::NativeQuery) {
         plan = ImportNativeQuery(request.parsed_query().native_query(), ctx, benchmark.NativeCatalog(),
             signature ? &outputTypes : nullptr, &request.parameters());
     } else {
@@ -436,8 +452,9 @@ void CaptureLogicalRoots(TLogicalPlan& logicalPlan, const TVector<TIntrusivePtr<
 }
 
 void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
-    const bool hasNative = inputs.size() == StageNames.size();
-    Y_ENSURE(hasNative || inputs.size() == StageNames.size() - 1, "Provide four syntax requests or all five requests");
+    const bool hasNative = inputs.size() >= 5;
+    const bool hasLogical = inputs.size() == StageNames.size();
+    Y_ENSURE(inputs.size() >= 4 && inputs.size() <= StageNames.size(), "Provide four to six benchmark stages");
     const auto text = std::find_if(inputs.begin(), inputs.end(), [](const TInput& input) { return input.Stage == EStage::Text; });
     Y_ENSURE(text != inputs.end(), "Missing text reference request");
     const auto session = CreateRunnerSession(benchmark.Catalog);
@@ -445,6 +462,7 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
     std::array<bool, StageNames.size()> seen{};
     TRequest expectedEnvelope;
     Ydb::Query::NativeQuery expectedPlan;
+    Ydb::Query::LogicalPlan expectedWireLogical;
     std::optional<Ydb::Query::SyntaxScript> expectedScript;
     TLogicalPlan expectedLogicalPlan;
     TVector<TVector<TString>> expectedTypes;
@@ -453,7 +471,8 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
         const auto index = static_cast<size_t>(stage);
         const auto name = StageNames[index];
         Y_ENSURE(!seen[index], "Duplicate benchmark stage: " << name);
-        Y_ENSURE(hasNative || stage != EStage::NativeQuery, "Four-input comparisons require the four syntax stages");
+        Y_ENSURE((hasNative || stage != EStage::NativeQuery) && (hasLogical || stage != EStage::LogicalPlan),
+            "Provide the syntax stages followed by optional NativeQuery and LogicalPlan");
         seen[index] = true;
         TRequest request;
         DecodeRequest(bytes, request);
@@ -488,7 +507,16 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
                 expectedScript = std::move(wire);
             }
         }
-        if (hasNative) {
+        if (hasLogical && (stage == EStage::Text || stage == EStage::LogicalPlan)) {
+            const auto ordinals = script ? SourceOrdinals(*script) : SourceOrdinals(request.parsed_query().logical_plan());
+            auto wire = ExportLogicalPlan(*plan, ordinals, benchmark.NativeCatalog(), &request.parameters());
+            if (stage == EStage::Text) {
+                expectedWireLogical = std::move(wire);
+            } else {
+                Y_ENSURE(equals(expectedWireLogical, wire), "LogicalPlan graph or output differs from text");
+            }
+        }
+        if (hasNative && stage != EStage::LogicalPlan) {
             const auto ordinals = script ? SourceOrdinals(*script) : SourceOrdinals(request.parsed_query().native_query());
             auto wire = ExportNativeQuery(*plan, ordinals, benchmark.NativeCatalog(), &request.parameters());
             if (stage == EStage::NativeQuery) {
@@ -499,7 +527,7 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
             } else {
                 expectedPlan = std::move(wire);
             }
-        } else if (i != 0) {
+        } else if (!hasNative && i != 0) {
             Y_ENSURE(expectedLogicalPlan == logicalPlan, "Types or logical plan differ for " << name);
         } else {
             expectedLogicalPlan = std::move(logicalPlan);
@@ -513,6 +541,43 @@ void Verify(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
     }
     if (hasNative) {
         CheckRoundTrip(expectedPlan, benchmark.NativeCatalog(), &expectedEnvelope.parameters());
+    }
+}
+
+void VerifyLogicalImport(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark) {
+    Y_ENSURE(inputs.size() == 2 && inputs[0].Stage == EStage::Text && inputs[1].Stage == EStage::LogicalPlan,
+        "Expected a text reference and a LogicalPlan request");
+    const auto session = CreateRunnerSession(benchmark.Catalog);
+    TRequest envelope;
+    TVector<TString> reference;
+    TVector<TVector<TString>> referenceTypes;
+    for (const auto& input : inputs) {
+        TRequest request;
+        DecodeRequest(input.Bytes, request);
+        TExprContext ctx;
+        TIntrusivePtr<TTypeAnnotationContext> types;
+        std::unique_ptr<NNewYql::TScript> script;
+        TLogicalPlan signature;
+        const auto plan = ToNative(request, input.Stage, ctx, types, benchmark, script, nullptr, &signature);
+        TVector<TIntrusivePtr<TOpRoot>> roots;
+        PrepareRboRoots(plan, types, session, ctx, &roots);
+        CheckLambdas(*plan);
+        TVector<TString> actual;
+        TVector<TVector<TString>> actualTypes;
+        for (size_t i = 0; i < roots.size(); ++i) {
+            actual.push_back(LogicalSignature(*roots[i]));
+            actualTypes.push_back(signature.Roots.at(i).ResultTypes);
+        }
+        request.clear_query();
+        if (input.Stage == EStage::Text) {
+            envelope = std::move(request);
+            reference = std::move(actual);
+            referenceTypes = std::move(actualTypes);
+        } else {
+            Y_ENSURE(google::protobuf::util::MessageDifferencer::Equals(envelope, request), "Request envelope differs");
+            Y_ENSURE(referenceTypes == actualTypes, "Logical result types differ");
+            Y_ENSURE(reference == actual, "LogicalPlan differs from text at RBO roots");
+        }
     }
 }
 
@@ -532,7 +597,7 @@ TSample Measure(const TString& bytes, const TBenchmarkContext& benchmark,
     const auto plan = ToNative(request, stage, ctx, types, benchmark, script, &sample.Imported,
         printColumns ? &signature : nullptr);
     sample.Native = TMeasurementTime::Now();
-    if (stage == EStage::NativeQuery) {
+    if (stage == EStage::NativeQuery || stage == EStage::LogicalPlan) {
         sample.Imported = sample.Native;
     }
     sample.Done = PrepareRboRoots(plan, types, session, ctx);
@@ -581,7 +646,11 @@ void RunRounds(const TCases& cases, size_t warmup, size_t repeats, TMeasure&& me
 }
 
 void Bench(const TVector<TInput>& inputs, const TBenchmarkContext& benchmark, size_t warmup, size_t repeats) {
-    Verify(inputs, benchmark);
+    if (inputs.size() == 2) {
+        VerifyLogicalImport(inputs, benchmark);
+    } else {
+        Verify(inputs, benchmark);
+    }
     const auto session = CreateRunnerSession(benchmark.Catalog);
     std::cout << "stage,iteration,bytes,decode_wall_ns,decode_cpu_ns,parse_or_import_wall_ns,parse_or_import_cpu_ns,"
         "frontend_wall_ns,frontend_cpu_ns,native_query_wall_ns,native_query_cpu_ns,runner_wall_ns,runner_cpu_ns,total_wall_ns,total_cpu_ns\n";
@@ -672,6 +741,17 @@ void SelfTest() {
             native->add_functions();
         }
         checkRejected("function or type registry size");
+
+        DecodeRequest(Prepare(EStage::LogicalPlan, sql, ExecutionEnvelope(), benchmark), request);
+        auto* logical = request.mutable_parsed_query()->mutable_logical_plan();
+        logical->mutable_roots(0)->clear_statement_index();
+        checkRejected("root destination or ordering");
+        logical->mutable_roots(0)->set_statement_index(0);
+        auto* wrongType = logical->add_types();
+        wrongType->set_id(logical->types_size());
+        wrongType->mutable_data()->set_slot("String");
+        logical->mutable_roots(0)->mutable_graph()->mutable_information_units(0)->set_defined_type_id(wrongType->id());
+        checkRejected("IU definition type mismatch");
     }
     for (const auto* text : {"SELECT 1", "SELECT true AS present, 21u AS n WHERE true",
         "SELECT 1; SELECT 2l", "DECLARE $unused AS Uint64; SELECT 1; SELECT 2",
@@ -708,7 +788,7 @@ void SelfTest() {
         Verify(MakeInputs(excluded), {});
 
         TRequest request;
-        DecodeRequest(inputs.back().Bytes, request);
+        DecodeRequest(inputs[static_cast<size_t>(EStage::NativeQuery)].Bytes, request);
         auto malformedHub = request.parsed_query().native_query();
         auto* plan = malformedHub.mutable_roots(0)->mutable_plan();
         Y_ENSURE(plan->replicate_hubs_size() == 2, "Derived join did not preserve both Replicate hubs");
@@ -728,7 +808,7 @@ void SelfTest() {
         const auto inputs = MakeInputs("SELECT COUNT(DISTINCT q.id) FROM (SELECT 1 AS id) AS q");
         Verify(inputs, {});
         TRequest request;
-        DecodeRequest(inputs.back().Bytes, request);
+        DecodeRequest(inputs[static_cast<size_t>(EStage::NativeQuery)].Bytes, request);
         auto malformedCount = request.parsed_query().native_query();
         auto* operators = malformedCount.mutable_roots(0)->mutable_plan()->mutable_operators();
         const auto aggregate = std::find_if(operators->begin(), operators->end(),
@@ -781,7 +861,7 @@ void SelfTest() {
     column->mutable_column()->set_row_argument_expr_id(0);
     CheckRejected(memberPlan);
 
-    std::cout << "five-stage logical equivalence and native round-trip checks passed\n";
+    std::cout << "six-stage logical equivalence and native round-trip checks passed\n";
 }
 
 std::pair<size_t, size_t> Iterations(const char* warmupArg, const char* repeatsArg) {
@@ -838,7 +918,7 @@ int Run(int argc, const char** argv) {
     }
     const TStringBuf mode = first < argc ? argv[first] : "";
     const auto validStageCount = [](int count) {
-        return count == static_cast<int>(StageNames.size()) || count == static_cast<int>(StageNames.size() - 1);
+        return count >= 4 && count <= static_cast<int>(StageNames.size());
     };
     const int args = argc - first - 1;
     Y_ENSURE(!templatePath || mode == "--export" || mode == "--client", "Request template is only used for export and client timing");
@@ -884,7 +964,12 @@ int Run(int argc, const char** argv) {
         BenchHostText(bytes, benchmark.Catalog, roots, ctx, expectedTypes, warmup, repeats);
         return 0;
     }
-    if (mode == "--bench" && validStageCount(args - 2)) {
+    if (mode == "--verify-import" && args == 2) {
+        VerifyLogicalImport(ReadInputs(args, argv + first + 1), benchmark);
+        std::cout << "LogicalPlan matches text at RBO roots\n";
+        return 0;
+    }
+    if ((mode == "--bench-import" && args == 4) || (mode == "--bench" && validStageCount(args - 2))) {
         const auto [warmup, repeats] = Iterations(argv[first + 1], argv[first + 2]);
         Bench(ReadInputs(args - 2, argv + first + 3), benchmark, warmup, repeats);
         return 0;
@@ -898,13 +983,17 @@ int Run(int argc, const char** argv) {
     std::cerr << "Usage:\n"
         << "  parsed_query_native_bench --self-test\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json] [--template REQUEST.pb]"
-           " --export QUERY.sql TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
+           " --export QUERY.sql TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb [LOGICAL.pb]]\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json]"
-           " --verify TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
+           " --verify-import TEXT.pb LOGICAL.pb\n"
+        << "  parsed_query_native_bench [--catalog CATALOG.json]"
+           " --verify TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb [LOGICAL.pb]]\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json]"
            " --host-text WARMUP REPEATS TEXT.pb\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json]"
-           " --bench WARMUP REPEATS TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb]\n"
+           " --bench-import WARMUP REPEATS TEXT.pb LOGICAL.pb\n"
+        << "  parsed_query_native_bench [--catalog CATALOG.json]"
+           " --bench WARMUP REPEATS TEXT.pb ANTLR_AST.pb ANTLR_CST.pb SCRIPT.pb [NATIVE.pb [LOGICAL.pb]]\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json] [--template REQUEST.pb]"
            " --client WARMUP REPEATS QUERY.sql STAGE...\n"
         << "  parsed_query_native_bench [--catalog CATALOG.json] --check-request REQUEST.pb\n"

@@ -5,6 +5,9 @@ logical roots consumed by KQP’s new RBO. The text path uses KQP's YQL parser. 
 paths import their own representations into an owning `TScript`. All four
 routes use the same KQP name resolution, type annotation and RBO lowering.
 The `native_query` path validates and imports the bound logical plan directly.
+The `logical_plan` path resolves table and column names against the catalog,
+checks each IU's declared type at its definition and imports the graph through
+the same operator reader. Its timer includes this conversion and validation.
 
 ```text
 Decode ExecuteQueryRequest
@@ -13,7 +16,8 @@ Decode ExecuteQueryRequest
   antlr_cst   → restore ANTLR CST from nodes and tokens ──────┘
   script      → restore TScript
   TScript     → ResolveNames → AnnotateAst → LowerToRbo → wrap logical roots ─┐
-  native_query → ImportNativeQuery → check bindings against the catalog ──────┴→ TNativeQuery
+  native_query → ImportNativeQuery → check bindings against the catalog ─────┤
+  logical_plan → ImportLogicalPlan → bind reads and validate typed graph ─────┴→ TNativeQuery
 TNativeQuery → create runner → PrepareNativeQuery → DoTransform → assign Roots → ComputeParents → stop before if (Roots.size() > 1)
 ```
 
@@ -42,16 +46,31 @@ and benchmark rounds require each input to reach the roots through its declared
 stage. Use `--client-ready` for client serialization when the structured
 representation is already available.
 
-## Five formats without a catalog
+For a separately constructed read-only LogicalPlan, verify and time two complete
+requests with matching execution envelopes.
+
+```sh
+"$bench" --catalog catalog.json --verify-import text.pb logical.pb
+"$bench" --catalog catalog.json --bench-import 30 300 text.pb logical.pb
+```
+
+The comparison follows bound column values through maps. It compares read
+paths, join kinds and keys, filters, aggregates, result order, labels and YQL
+types at the RBO roots. The supported profile has one public result per
+statement, unordered output, unit rows, scans, maps, filters, equijoins,
+COUNT and single-consumer replicate ports. Other destinations and operators,
+including writes and materializations, fail explicitly.
+
+## Six formats without a catalog
 
 ```sh
 dir=$(mktemp -d)
 printf '%s\n' 'SELECT 1;' > "$dir/query.yql"
-set -- "$dir/text.pb" "$dir/ast.pb" "$dir/cst.pb" "$dir/script.pb" "$dir/native.pb"
+set -- "$dir/text.pb" "$dir/ast.pb" "$dir/cst.pb" "$dir/script.pb" "$dir/native.pb" "$dir/logical.pb"
 "$bench" --export "$dir/query.yql" "$@"
 "$bench" --verify "$@"
 "$bench" --bench 30 300 "$@" > "$dir/frontend.csv"
-"$bench" --client 30 300 "$dir/query.yql" text antlr_ast antlr_cst script native_query > "$dir/client.csv"
+"$bench" --client 30 300 "$dir/query.yql" text antlr_ast antlr_cst script native_query logical_plan > "$dir/client.csv"
 ```
 
 The native codec covers read-only plans built from a singleton source,
