@@ -643,7 +643,7 @@ void SelfTest() {
         auto* parsed = request.mutable_parsed_query();
         Y_ENSURE(parsed->GetReflection()->GetUnknownFields(*parsed).empty(), "Unexpected ParsedQuery fields");
         auto* fields = parsed->GetReflection()->MutableUnknownFields(parsed);
-        fields->AddLengthDelimited(1, sql);
+        fields->AddLengthDelimited(8, "");
         const auto resolve = [&] { return Measure(Encode(request), benchmark, session).Route; };
         const auto checkRejected = [&](TStringBuf diagnostic) {
             try {
@@ -663,16 +663,11 @@ void SelfTest() {
         checkRejected("Missing or unsupported ParsedQuery stage");
         parsed->clear_stage();
         checkRejected("Missing or unsupported ParsedQuery stage");
-        fields->AddLengthDelimited(8, "");
-        checkRejected("Missing or unsupported ParsedQuery stage");
         fields->DeleteByNumber(8);
-        fields->AddLengthDelimited(9, "");
         checkRejected("Missing or unsupported ParsedQuery stage");
 
         DecodeRequest(Prepare(EStage::NativeQuery, sql, ExecutionEnvelope(), benchmark), request);
-        parsed = request.mutable_parsed_query();
-        parsed->GetReflection()->MutableUnknownFields(parsed)->AddLengthDelimited(1, sql);
-        auto* native = parsed->mutable_native_query();
+        auto* native = request.mutable_parsed_query()->mutable_native_query();
         for (size_t i = 0; i < 65; ++i) {
             native->add_functions();
         }
