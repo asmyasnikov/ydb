@@ -377,6 +377,7 @@ public:
                 FederatedQuerySetup, ModuleResolverState, Counters, Settings.QueryService, GUCSettings));
             WorkerId = RegisterWithSameMailbox(workerActor.release());
         }
+        QueryState->RequestEv->DisablePgCompatibility = QueryState->GetDisablePgCompatibility();
         WorkerStatsMode = QueryState->GetStatsMode();
         TlsActivationContext->Send(new IEventHandle(*WorkerId, SelfId(), QueryState->RequestEv.release(), ev->Flags, ev->Cookie,
                     nullptr, QueryState->KqpSessionSpan.GetTraceId()));
@@ -608,6 +609,14 @@ public:
 
             case NKikimrKqp::QUERY_ACTION_TOPIC:
                 return AddOffsetsToTransaction();
+        }
+
+        if (QueryState->GetDisablePgCompatibility()) {
+            try {
+                TQueryData::ValidateNoPgParameters(QueryState->GetYdbParameters());
+            } catch (const yexception& e) {
+                ythrow TRequestFail(Ydb::StatusIds::BAD_REQUEST) << e.what();
+            }
         }
 
         QueryState->UpdateTempTablesState(TempTablesState);
