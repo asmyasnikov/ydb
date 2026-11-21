@@ -750,6 +750,7 @@ public:
             size_t depth = 1;
             auto decoded = ReadOperator(op, depth);
             Y_ENSURE(depth <= MaxOperatorDepth, "NativeQuery operator nesting limit exceeded");
+            decoded->InitializeOutputIUs();
             Operators.push_back({std::move(decoded), depth});
         }
         auto input = TakeOperator(plan.input_operator_id()).Node;
@@ -789,7 +790,6 @@ public:
         for (const auto& entry : IterateSubtreeWithSubplans(result.Get(), result->PlanProps)) {
             entry.Current->BindExpressionPlanProps(&result->PlanProps);
         }
-        result->RecomputeOutputIUsSubtree();
         result->ComputeParents();
         return result;
     }
